@@ -85,5 +85,52 @@ class PieBridgeSmokeTest(unittest.TestCase):
             self.assertTrue(ue.SystemLibrary.print_string.called)
 
 
+class FabLibraryTests(unittest.TestCase):
+    def test_classify_typical_fab_names(self):
+        from unreal_tools.fab_library import classify
+        cases = {
+            ("SM_Soviet_Apartment_Block_01", "StaticMesh"): "building.town",
+            ("SM_Abandoned_Warehouse", "StaticMesh"): "building.industrial",
+            ("SM_Rusty_Barrel_A", "StaticMesh"): "container",
+            ("SM_Lada_Wreck", "StaticMesh"): "vehicle",
+            ("SM_Birch_Tree_02", "StaticMesh"): "tree",
+            ("S_Mossy_Rock_uhrmbd_LOD0", "StaticMesh"): "rock",
+            ("SK_Zombie_Male", "SkeletalMesh"): "creature.infected",
+            ("SK_MutantDog", "SkeletalMesh"): "creature.pseudodog",
+            ("MI_Old_Asphalt_Road", "MaterialInstanceConstant"): "material.Asphalt",
+            ("MI_Concrete_Wall_Worn", "MaterialInstanceConstant"): "material.Concrete",
+        }
+        for (name, cls), role in cases.items():
+            self.assertEqual(classify(name, f"/Game/Fab/Pack/{name}", cls), role, name)
+
+    def test_builder_uses_fab_meshes(self):
+        ue, spawned = fake_unreal()
+        with mock.patch.dict(sys.modules, {"unreal": ue}):
+            for name in [m for m in sys.modules if m.startswith("unreal_tools")]:
+                del sys.modules[name]
+            from unreal_tools.fab_library import FabLibrary
+            from unreal_tools.level_builder import LevelBuilder
+            fab = FabLibrary()
+            for path, cls in (("/Game/Fab/A/SM_Apartment_Building", "StaticMesh"),
+                              ("/Game/Fab/A/SM_Old_House", "StaticMesh"),
+                              ("/Game/Fab/A/SM_Wooden_Crate", "StaticMesh"),
+                              ("/Game/Fab/A/SM_Pine_Tree", "StaticMesh"),
+                              ("/Game/Fab/A/SK_Zombie", "SkeletalMesh")):
+                fab.add(f"{path}.{path.rsplit('/', 1)[1]}", path.rsplit("/", 1)[1], cls)
+            mesh = mock.MagicMock()
+            box = mesh.get_bounding_box.return_value
+            box.min, box.max = FakeVector(-500, -500, 0), FakeVector(500, 500, 800)
+            mesh.get_path_name.return_value = "mesh"
+            ue.load_asset.return_value = mesh
+            builder = LevelBuilder(seed=7, landscape_size=505, fab=fab)
+            builder.build()
+            meshes = [c.args[0] for a in spawned
+                      for c in a.static_mesh_component.set_static_mesh.call_args_list]
+            self.assertIn(mesh, meshes)
+            skeletal = [a for a in spawned
+                        if a.skeletal_mesh_component.set_skeletal_mesh_asset.called]
+            self.assertTrue(skeletal)
+
+
 if __name__ == "__main__":
     unittest.main()

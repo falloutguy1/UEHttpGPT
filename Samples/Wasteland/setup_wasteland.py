@@ -9,7 +9,11 @@ Steps (each optional, in order):
     --import          import Downloads/ (+ Downloads/Manual/ drops) into /Game/Wasteland
     --datatables MOD  export CSVs + WastelandRows.h and import them as DataTables
                       (MOD = your C++ game module that compiled WastelandRows.h)
-    --build           create /Game/Wasteland/Maps/L_Wasteland and block out the map
+    --build           create /Game/Wasteland/Maps/L_Wasteland and build the map with the
+                      Fab assets you added to the project (placeholders where none fit)
+    --fab-roots ...   content folders to scan for Fab assets (default /Game/Fab,
+                      /Game/Megascans and the rest of /Game)
+    --no-fab          ignore Fab assets, placeholders only
     --pie             arm the Play-In-Editor survival prototype
 """
 
@@ -42,10 +46,10 @@ def main(argv: list) -> None:
     parser.add_argument("--height-range", type=float, default=400.0)
     parser.add_argument("--rebuild", action="store_true",
                         help="Delete previously built Wasteland actors first")
+    parser.add_argument("--fab-roots", nargs="*", default=None)
+    parser.add_argument("--no-fab", action="store_true")
     parser.add_argument("--pie", action="store_true")
     args = parser.parse_args(argv)
-    if args.build:
-        args.do_import = True            # building wants the materials
 
     if args.download:
         unreal.log("Wasteland: downloading CC0 assets ...")
@@ -82,7 +86,16 @@ def main(argv: list) -> None:
             les.new_level(MAP_PATH)
         if args.rebuild:
             unreal.log(f"Wasteland: removed {clear_wasteland_actors()} old actors")
-        builder = LevelBuilder(args.seed, args.height_range, args.landscape_size)
+        fab = None
+        if not args.no_fab:
+            from unreal_tools.fab_library import DEFAULT_ROOTS, FabLibrary
+            fab = FabLibrary.scan(tuple(args.fab_roots or DEFAULT_ROOTS), args.seed)
+            fab.write_report(ROOT / "Exports" / "fab_library.json")
+            if not fab.by_role:
+                unreal.log_warning("Wasteland: no Fab assets found. Add them from Window -> "
+                                   "Fab (My Library -> Add to Project) and rebuild.")
+                fab = None
+        builder = LevelBuilder(args.seed, args.height_range, args.landscape_size, fab=fab)
         heightmap = ROOT / "Exports" / f"heightmap_{args.seed}_{args.landscape_size}.png"
         if not heightmap.exists():
             write_png16(heightmap, generate(builder.world, args.landscape_size))

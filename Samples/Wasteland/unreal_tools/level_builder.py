@@ -15,6 +15,7 @@ prints. Z snaps to that terrain.
 from __future__ import annotations
 
 import math
+import random
 
 import unreal
 
@@ -44,7 +45,10 @@ METRO_DEPTH_UU = 3000.0      # platforms sit 30 m under the surface
 
 class LevelBuilder:
     def __init__(self, seed: int = 1986, height_range_m: float = 400.0,
-                 landscape_size: int = 1009):
+                 landscape_size: int = 1009, fab=None):
+        self.fab = fab                    # FabLibrary, or None for placeholders
+        self.rng = random.Random(seed + 1)
+        self._bounds = {}
         self.world = WorldLayout(seed)
         self.terrain = Terrain(self.world)
         self.z_scale = landscape_scale(self.world, landscape_size, height_range_m)[2]
@@ -62,9 +66,46 @@ class LevelBuilder:
     def material(self, slot: str):
         if slot not in self._materials:
             path = f"{MAT_ROOT}/MI_{slot}"
-            self._materials[slot] = eal.load_asset(path) if eal.does_asset_exist(path) \
-                else eal.load_asset(FALLBACK_MAT)
+            fab_mat = self.fab.material(slot) if self.fab else None
+            self._materials[slot] = fab_mat or (eal.load_asset(path) if eal.does_asset_exist(path)
+                                                else eal.load_asset(FALLBACK_MAT))
         return self._materials[slot]
+
+    def mesh_bounds(self, mesh) -> tuple:
+        """(radius_m, min_z_uu) of a static mesh, cached."""
+        key = mesh.get_path_name()
+        if key not in self._bounds:
+            box = mesh.get_bounding_box()
+            radius = max(box.max.x - box.min.x, box.max.y - box.min.y) / 200.0
+            self._bounds[key] = (radius, box.min.z)
+        return self._bounds[key]
+
+    def place(self, mesh, x: float, y: float, yaw: float, label: str, folder: str,
+              tags: list, z_offset_uu: float = 0.0, sink_uu: float = 30.0, scale: float = 1.0):
+        """Spawn a real (Fab) mesh at true size, resting on the terrain."""
+        _, min_z = self.mesh_bounds(mesh)
+        loc = self.to_uu(x, y, z_offset_uu - min_z * scale - sink_uu)
+        actor = eas.spawn_actor_from_class(unreal.StaticMeshActor, loc,
+                                           unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw))
+        comp = actor.static_mesh_component
+        comp.set_static_mesh(mesh)
+        comp.set_mobility(unreal.ComponentMobility.STATIC)
+        if scale != 1.0:
+            actor.set_actor_scale3d(unreal.Vector(scale, scale, scale))
+        self._finish(actor, label, folder, tags)
+        return actor
+
+    def place_skeletal(self, mesh, loc: unreal.Vector, yaw: float, label: str, folder: str,
+                       tags: list):
+        actor = eas.spawn_actor_from_class(unreal.SkeletalMeshActor, loc,
+                                           unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw))
+        comp = actor.skeletal_mesh_component
+        try:
+            comp.set_skeletal_mesh_asset(mesh)          # UE 5.1+
+        except AttributeError:
+            comp.set_skeletal_mesh(mesh)
+        self._finish(actor, label, folder, tags)
+        return actor
 
     def _finish(self, actor, label: str, folder: str, tags: list) -> None:
         actor.set_actor_label(label)
@@ -103,7 +144,7 @@ class LevelBuilder:
     # -- Build steps --------------------------------------------------------------------
     def build(self, lighting: bool = True, sky_cubemap=None) -> int:
         with unreal.ScopedEditorTransaction("Build Wasteland"):
-            with unreal.ScopedSlowTask(len(self.world.pois) + 3, "Building Wasteland") as task:
+            with unreal.ScopedSlowTask(len(self.world.pois) + 4, "Building Wasteland") as task:
                 task.make_dialog(True)
                 if lighting:
                     task.enter_progress_frame(1, "Sky, sun and fog")
@@ -112,6 +153,8 @@ class LevelBuilder:
                 self.build_hazard_volumes()
                 task.enter_progress_frame(1, "Roads")
                 self.build_roads()
+                if self.fab:
+                    self.build_scatter()
                 for poi in self.world.pois:
                     if task.should_cancel():
                         break
@@ -201,6 +244,43 @@ class LevelBuilder:
                 mid = self.to_uu((ax + bx) / 2, (ay + by) / 2, 10.0)
                 self.box(mid, (seg * 1.02, 7.0, 0.2), yaw, "Asphalt",
                          f"Road_{i:03d}_{j:02d}", "Roads", ["Wasteland.Road"], pitch=pitch)
+                if not self.fab:
+                    continue
+                cx, cy = (ax + bx) / 2, (ay + by) / 2
+                nx, ny = -(y2 - y1) / length, (x2 - x1) / length     # road normal
+                pole = self.fab.pick("utility")
+                if pole and j % 2 == 0:
+                    self.place(pole, cx + nx * 6, cy + ny * 6, yaw, f"Road_{i:03d}_{j:02d}_Pole",
+                               "Roads", ["Wasteland.Road.Prop"])
+                wreck = self.fab.pick("vehicle")
+                if wreck and self.rng.random() < 0.12:
+                    side = self.rng.choice((-1, 1))
+                    self.place(wreck, cx + nx * 5 * side, cy + ny * 5 * side,
+                               yaw + self.rng.uniform(-35, 35), f"Road_{i:03d}_{j:02d}_Wreck",
+                               "Roads", ["Wasteland.Wreck", "Wasteland.Loot",
+                                         "Wasteland.Loot.civilian"])
+
+    def build_scatter(self, trees: int = 1500, rocks: int = 400, debris: int = 600,
+                      foliage: int = 1200) -> None:
+        """Forests in the west, rocks in the Zone, rubble in the dead city."""
+        size = self.world.size_m
+        west = (0.0, size / 3)
+        east = (size * 2 / 3, size)
+        plans = (("tree", trees, (0.0, size * 0.75)), ("foliage", foliage, (0.0, size)),
+                 ("rock", rocks, east), ("debris", debris, (size / 3, size)),
+                 ("tree", trees // 3, west))
+        for role, count, (lo, hi) in plans:
+            if not self.fab.has(role):
+                continue
+            for n in range(count):
+                x, y = self.rng.uniform(lo, hi), self.rng.uniform(0, size)
+                poi = self.world.poi_at(x, y)
+                if poi and role in ("tree", "rock") and poi.kind not in ("farm", "anomaly_field"):
+                    continue                     # keep settlements clear
+                mesh = self.fab.pick(role)
+                self.place(mesh, x, y, self.rng.uniform(0, 360), f"Scatter_{role}_{n:04d}",
+                           f"Scatter/{role}", [f"Wasteland.Scatter.{role}"],
+                           scale=self.rng.uniform(0.8, 1.25))
 
     def build_poi(self, poi: POI) -> None:
         folder = f"POI/{poi.kind}/{poi.name}"
@@ -216,15 +296,30 @@ class LevelBuilder:
         self._finish(label, f"Label_{poi.name}", folder, base_tags)
 
         slot = KIND_MATERIAL.get(poi.kind, "Concrete")
+        placed = []                              # (x, y, radius) of Fab buildings
         for i, (bx, by, w, d, h, rot) in enumerate(poi.buildings):
-            # Sink 1 m into the ground so slopes don't leave gaps.
+            b_tags = base_tags + ["Wasteland.Building"]
+            mesh = self.fab.building_for(poi.kind) if self.fab else None
+            if mesh is not None:
+                radius, _ = self.mesh_bounds(mesh)
+                if any(math.hypot(bx - px, by - py) < radius + pr for px, py, pr in placed):
+                    continue                     # real buildings are bigger than the blockout
+                placed.append((bx, by, radius))
+                self.place(mesh, bx, by, rot, f"{poi.name}_Bldg_{i:02d}", folder, b_tags,
+                           sink_uu=100.0)
+                continue
+            # Placeholder: sink 1 m into the ground so slopes don't leave gaps.
             loc = self.to_uu(bx, by, (h / 2 - 1.0) * 100.0)
-            self.box(loc, (w, d, h), rot, slot, f"{poi.name}_Bldg_{i:02d}", folder,
-                     base_tags + ["Wasteland.Building"])
+            self.box(loc, (w, d, h), rot, slot, f"{poi.name}_Bldg_{i:02d}", folder, b_tags)
 
         for i, (lx, ly) in enumerate(poi.loot_spots):
-            self.marker(self.to_uu(lx, ly, 100.0), f"{poi.name}_Loot_{i:02d}", folder,
-                        base_tags + ["Wasteland.Loot", f"Wasteland.Loot.{poi.loot_table}"])
+            l_tags = base_tags + ["Wasteland.Loot", f"Wasteland.Loot.{poi.loot_table}"]
+            container = self.fab.pick("container") if self.fab else None
+            if container is not None and not any(
+                    math.hypot(lx - px, ly - py) < pr for px, py, pr in placed):
+                self.place(container, lx, ly, self.rng.uniform(0, 360),
+                           f"{poi.name}_LootBox_{i:02d}", folder, l_tags)
+            self.marker(self.to_uu(lx, ly, 100.0), f"{poi.name}_Loot_{i:02d}", folder, l_tags)
 
         for i, creature in enumerate(poi.creatures):
             angle = i / max(1, len(poi.creatures)) * math.tau
@@ -232,8 +327,13 @@ class LevelBuilder:
             sy = poi.y + math.sin(angle) * poi.radius_m * 0.6
             z = -METRO_DEPTH_UU + 150 if poi.underground and creature in ("nosalis", "librarian") \
                 else 150.0
-            self.marker(self.to_uu(sx, sy, z), f"{poi.name}_Spawn_{creature}", folder,
-                        base_tags + ["Wasteland.Spawn", f"Wasteland.Spawn.{creature}"])
+            s_tags = base_tags + ["Wasteland.Spawn", f"Wasteland.Spawn.{creature}"]
+            self.marker(self.to_uu(sx, sy, z), f"{poi.name}_Spawn_{creature}", folder, s_tags)
+            body = self.fab.pick(f"creature.{creature}", "creature.infected") if self.fab else None
+            if body is not None:
+                self.place_skeletal(body, self.to_uu(sx, sy, z - 150.0),
+                                    self.rng.uniform(0, 360), f"{poi.name}_{creature}",
+                                    folder, s_tags + ["Wasteland.Creature"])
 
         if poi.faction:
             self.marker(centre, f"{poi.name}_Faction_{poi.faction}", folder,
@@ -249,8 +349,13 @@ class LevelBuilder:
     def build_metro_station(self, poi: POI, folder: str, tags: list) -> None:
         """Surface pavilion + a platform hall 30 m down + tunnel mouths."""
         tags = tags + ["Wasteland.Metro"]
-        self.box(self.to_uu(poi.x, poi.y, 250.0), (10, 10, 5), 0, "Concrete",
-                 f"{poi.name}_Entrance", folder, tags + ["Wasteland.Metro.Entrance"])
+        entrance = self.fab.pick("building.metro") if self.fab else None
+        if entrance is not None:
+            self.place(entrance, poi.x, poi.y, 0.0, f"{poi.name}_Entrance", folder,
+                       tags + ["Wasteland.Metro.Entrance"])
+        else:
+            self.box(self.to_uu(poi.x, poi.y, 250.0), (10, 10, 5), 0, "Concrete",
+                     f"{poi.name}_Entrance", folder, tags + ["Wasteland.Metro.Entrance"])
         depth = -METRO_DEPTH_UU
         hall = (80.0, 20.0, 7.0)
         floor = self.to_uu(poi.x, poi.y, depth)
