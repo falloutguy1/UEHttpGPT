@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.4",
+	"Category": "",
+	"Description": "Spectate an AI-controlled survivor leading a squad through a zombie apocalypse.",
+	"Modules": [
+		{
+			"Name": "SurvivorSpectator",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "HttpGPT",
+			"Enabled": true,
+			"Optional": true
+		}
+	]
+}
