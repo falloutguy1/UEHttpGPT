@@ -13,8 +13,10 @@
 	"Plugins": [
 		{
 			"Name": "HttpGPT",
-			"Enabled": true,
-			"Optional": true
+			"Enabled": true
 		}
+	],
+	"AdditionalPluginDirectories": [
+		"../../"
 	]
 }

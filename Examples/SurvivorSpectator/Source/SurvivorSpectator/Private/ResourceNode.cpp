@@ -1,7 +1,9 @@
 #include "ResourceNode.h"
 
+#include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/TextRenderComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "SurvivalAssets.h"
 
 AResourceNode::AResourceNode()
@@ -69,7 +71,7 @@ void AResourceNode::Setup(EResourceType InType, int32 InMaxAmount)
 
 	// Basic shapes are centred on their origin, so lift the node to sit on the ground.
 	AddActorWorldOffset(FVector(0, 0, 50.f * Base->GetComponentScale().Z));
-	Label->SetWorldLocation(GetActorLocation() + FVector(0, 0, Type == EResourceType::Wood ? 380.f : 160.f));
+	Label->SetWorldLocation(GetActorLocation() + FVector(0, 0, Type == EResourceType::Wood ? 470.f : 160.f));
 	RefreshVisuals();
 }
 
