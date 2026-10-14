@@ -1922,7 +1922,7 @@ class FX:
         self.n = 0
         tcoll = cols["Templates"]
         bm = bmesh.new()
-        bm_box(bm, (0, 0, 0), (0.16, 0.012, 0.012))
+        bm_box(bm, (0, 0, 0), (0.01, 0.16, 0.01))    # instances align their Y axis to velocity
         self.spark = mesh_obj("TPL_Spark", bm, tcoll, [M["spark"]], smooth=False)
         bm = bmesh.new()
         bmesh.ops.create_icosphere(bm, subdivisions=1, radius=0.05)
@@ -2120,7 +2120,7 @@ SHOTS = [
          target=Track([(121, Vector((-0.4, -2.2, 4.9))), (168, Vector((-0.4, -1.8, 4.7)))]),
          lens=Track([(121, 24.0), (168, 27.0)])),
     dict(name="CAM_04_Leaper_POV", start=169, end=228, fstop=5.6, shake=0.7, exposure=0.6,
-         pos=Track([(169, Vector((-0.75, -3.9, 5.5))), (228, Vector((-0.55, -3.45, 5.4)))]),
+         pos=Track([(169, Vector((0.9, -2.0, 5.6))), (228, Vector((1.0, -1.6, 5.5)))]),
          target=Track([(169, Vector((1.6, 4.5, 3.4))), (190, Vector((2.0, 5.6, 3.45))),
                        (228, Vector((2.1, 6.0, 3.5)))]),
          lens=Track([(169, 26.0), (228, 32.0)]), focus=Track([(169, 10.5), (228, 10.2)])),
