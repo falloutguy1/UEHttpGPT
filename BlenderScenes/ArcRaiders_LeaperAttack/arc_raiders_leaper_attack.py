@@ -2,7 +2,7 @@
 ARC Raiders fan scene: "Leaper at the Wall"
 ===========================================
 
-A fully procedural Blender action scene. A Leaper (the big four-legged,
+A Blender action scene. A Leaper (the big four-legged,
 pouncing ARC machine) leaps off a ruined tower, lands in the sand of a
 Buried-City-style ruin and tears open the facade of an apartment block to
 get at a terrified Raider who is cornered in a second-floor room.
@@ -10,7 +10,11 @@ get at a terrified Raider who is cornered in a second-floor room.
 The script generates everything: terrain, buildings, a pre-fractured wall,
 the rigged Leaper (IK legs), a posable Raider, interior props, dust/sparks
 FX, lighting, six cameras with handheld shake and timeline-marker cuts.
-It needs no external assets or add-ons.
+
+Photorealism comes from free CC0 assets fetched on first run: Poly Haven
+photo textures and a desert HDRI, and (if the MPFB add-on is installed, or
+with --install-mpfb) a realistic MakeHuman body for the Raider. Offline, or
+with --assets off, everything falls back to procedural shading.
 
 Shot list (24 fps, frames 1-288, about 12 s)
   1   1- 60  Exterior wide: the Leaper pounces, lands, rears up, first strike
@@ -27,16 +31,25 @@ Usage
     blender -b --python arc_raiders_leaper_attack.py -- --save leaper_attack.blend
     blender -b --python arc_raiders_leaper_attack.py -- --preview --render-frames 40 100 200
     blender -b --python arc_raiders_leaper_attack.py -- --render-anim --out /tmp/leaper/
+    blender -b --python arc_raiders_leaper_attack.py -- --install-mpfb --pack --save leaper.blend
+    blender -b --python arc_raiders_leaper_attack.py -- --assets off      (no downloads)
 
 Tested with Blender 4.5 LTS and 5.2. Fan work; ARC Raiders is a trademark of
-Embark Studios. Every model is an original approximation built from primitives.
+Embark Studios. The Leaper and Raider are original models (no game assets).
+Asset credits: Poly Haven (CC0), MakeHuman system assets (CC0) via MPFB.
 """
 
 import argparse
+import importlib
+import json
 import math
 import os
 import random
+import re
+import shutil
+import subprocess
 import sys
+import zipfile
 
 import bmesh
 import bpy
@@ -393,6 +406,197 @@ def key_visibility(ob, f_on, f_off=None):
 
 
 # =============================================================================
+# Optional free assets (all CC0): Poly Haven textures + HDRI, MakeHuman via MPFB
+# =============================================================================
+# Everything is downloaded once into a per-user cache. Without network access
+# (or with --assets off) the scene silently falls back to procedural shading.
+ASSETS = {"enabled": True, "dir": None, "tex_res": "1k", "hdri_res": "2k", "install_mpfb": False}
+USER_AGENT = "arc-leaper-scene/1.1 (Blender scene generator script)"
+POLYHAVEN_TEX = {   # material role -> Poly Haven texture id (CC0)
+    "plaster": "painted_plaster_wall",
+    "paint": "painted_plaster_wall",
+    "concrete": "chipped_concrete",
+    "tiles": "floor_tiles_06",
+    "sand": "dense_sand",
+    "wood": "weathered_planks",
+    "rust": "rusty_metal_02",
+    "arc_metal": "blue_metal_plate",
+    "leather": "fabric_leather_02",
+    "canvas": "denim_fabric",
+}
+HDRI_ID = "klippad_sunrise_2"     # Poly Haven, golden-hour desert, CC0
+MPFB_PAGE = "https://extensions.blender.org/add-ons/mpfb/"
+MAKEHUMAN_PACK = ("https://files.makehumancommunity.org/asset_packs/makehuman_system_assets/"
+                  "makehuman_system_assets_cc0.zip")
+_TEX_CACHE = {}
+
+
+def asset_dir():
+    d = ASSETS["dir"] or bpy.utils.user_resource("DATAFILES", path="arc_leaper_assets", create=True)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _download(url, path):
+    """Download `url` to `path` once; returns the path, or None when offline."""
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    if not ASSETS["enabled"]:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".part"
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    except Exception as exc:          # some setups only work through curl's proxy/CA config
+        try:
+            subprocess.run(["curl", "-sSfL", "-A", USER_AGENT, "-o", tmp, url], check=True, timeout=900)
+        except Exception:
+            print("[assets] could not download %s (%s)" % (url, exc))
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return None
+    os.replace(tmp, path)
+    return path
+
+
+def _json(url, path):
+    p = _download(url, path)
+    if p is None:
+        return None
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except ValueError:
+        os.remove(p)
+        return None
+
+
+def polyhaven_texture(asset_id):
+    """Colour/roughness/height/normal maps of a Poly Haven texture plus its
+    real-world size in metres, or None if unavailable."""
+    if asset_id in _TEX_CACHE:
+        return _TEX_CACHE[asset_id]
+    out = None
+    if ASSETS["enabled"]:
+        d = os.path.join(asset_dir(), "polyhaven", asset_id)
+        files = _json("https://api.polyhaven.com/files/" + asset_id, os.path.join(d, "files.json"))
+        info = _json("https://api.polyhaven.com/info/" + asset_id, os.path.join(d, "info.json"))
+        if files and info:
+            out = {"size": max(info.get("dimensions") or [1000.0]) / 1000.0}
+            for key, api in (("diff", "Diffuse"), ("rough", "Rough"), ("height", "Displacement"),
+                             ("nor", "nor_gl"), ("arm", "arm")):
+                try:
+                    url = files[api][ASSETS["tex_res"]]["jpg"]["url"]
+                except (KeyError, TypeError):
+                    continue
+                p = _download(url, os.path.join(d, os.path.basename(url)))
+                if p:
+                    out[key] = p
+            if "diff" not in out:
+                out = None
+    _TEX_CACHE[asset_id] = out
+    return out
+
+
+def polyhaven_hdri(asset_id):
+    if not ASSETS["enabled"]:
+        return None
+    d = os.path.join(asset_dir(), "polyhaven", asset_id)
+    files = _json("https://api.polyhaven.com/files/" + asset_id, os.path.join(d, "files.json"))
+    try:
+        url = files["hdri"][ASSETS["hdri_res"]]["hdr"]["url"]
+    except (KeyError, TypeError):
+        return None
+    return _download(url, os.path.join(d, os.path.basename(url)))
+
+
+def load_image(path, data=False):
+    img = bpy.data.images.load(path, check_existing=True)
+    if data:
+        try:
+            img.colorspace_settings.name = "Non-Color"
+        except TypeError:
+            img.colorspace_settings.is_data = True
+    return img
+
+
+def hdri_sun(img):
+    """(azimuth, elevation) in radians of the brightest pixel of an
+    equirectangular image, using Cycles' mapping convention."""
+    import numpy as np
+    w, h = img.size
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    px = px.reshape(h, w, 4)
+    lum = px[..., 0] * 0.2126 + px[..., 1] * 0.7152 + px[..., 2] * 0.0722
+    y, x = np.unravel_index(int(np.argmax(lum)), lum.shape)
+    return (0.5 - (x + 0.5) / w) * 2 * math.pi, ((y + 0.5) / h - 0.5) * math.pi
+
+
+def _mpfb_module():
+    for name in bpy.context.preferences.addons.keys():
+        if name.split(".")[-1] == "mpfb":
+            return name
+    return None
+
+
+def _install_mpfb():
+    """Download MPFB from extensions.blender.org and install it (opt-in)."""
+    page = _download(MPFB_PAGE, os.path.join(asset_dir(), "mpfb", "page.html"))
+    if not page:
+        return None
+    with open(page, encoding="utf-8", errors="ignore") as fh:
+        m = re.search(r'https://extensions\.blender\.org/download/[^"\s]+?\.zip[^"\s]*', fh.read())
+    if not m:
+        return None
+    url = m.group(0).replace("&amp;", "&")
+    zpath = _download(url, os.path.join(asset_dir(), "mpfb", url.split("/")[-1].split("?")[0]))
+    if not zpath:
+        return None
+    try:
+        bpy.ops.extensions.package_install_files(filepath=zpath, repo="user_default", enable_on_install=True)
+    except Exception as exc:
+        print("[assets] MPFB install failed:", exc)
+        return None
+    return _mpfb_module()
+
+
+def mpfb_human_service():
+    """MPFB's HumanService with the MakeHuman CC0 system assets in place,
+    or None (then the procedural Raider is used)."""
+    if not ASSETS["enabled"]:
+        return None
+    mod = _mpfb_module()
+    if mod is None and ASSETS["install_mpfb"]:
+        mod = _install_mpfb()
+    if mod is None:
+        print("[assets] MPFB add-on not found: using the procedural Raider "
+              "(install MPFB from Get Extensions, or run with --install-mpfb)")
+        return None
+    try:
+        hs = importlib.import_module(mod + ".services.humanservice").HumanService
+        data = importlib.import_module(mod + ".services.locationservice").LocationService.get_user_data()
+    except Exception as exc:
+        print("[assets] MPFB could not be loaded:", exc)
+        return None
+    probe = os.path.join(data, "skins", RAIDER_HUMAN["skin_mhmat"][:-6], RAIDER_HUMAN["skin_mhmat"])
+    if not os.path.exists(probe):
+        if not ASSETS["install_mpfb"]:
+            print("[assets] MakeHuman system assets missing in MPFB: run with --install-mpfb "
+                  "or load makehuman_system_assets_cc0.zip in MPFB")
+            return None
+        zpath = _download(MAKEHUMAN_PACK, os.path.join(asset_dir(), "makehuman_system_assets_cc0.zip"))
+        if not zpath:
+            return None
+        with zipfile.ZipFile(zpath) as zf:
+            zf.extractall(data)
+    return hs
+
+
+# =============================================================================
 # Materials
 # =============================================================================
 def _node(nt, kind, loc=(0, 0), **props):
@@ -495,7 +699,7 @@ def _new_material(name):
 def mat_surface(name, base, var=None, var_scale=1.5, rough=0.6, rough_var=0.15,
                 metal=0.0, coord="object", grime=0.0, streaks=0.0, bump=0.15,
                 bump_scale=9.0, band=None, checker=None, patches=None, scratches=0.0, emission=None,
-                emission_strength=0.0, coat=0.0):
+                emission_strength=0.0, coat=0.0, pbr=None, tint=(1.0, 1.0, 1.0), pbr_bump=0.5):
     """General weathered PBR surface built from procedural noise.
 
     var       second colour blended in by low-frequency noise
@@ -504,12 +708,30 @@ def mat_surface(name, base, var=None, var_scale=1.5, rough=0.6, rough_var=0.15,
     band      (z, colour) - wainscot: below z use this colour (needs coord='rest')
     checker   (scale, colour) floor tiles
     scratches bright worn-metal flecks (0..1)
+    pbr       Poly Haven texture id: box-projected photo maps at real-world
+              scale, multiplied by `tint`; the procedural layers above then
+              add large-scale variation and weathering on top
     """
     mat, nt, out = _new_material(name)
     bsdf = _node(nt, "ShaderNodeBsdfPrincipled", (200, 0))
     vec = _coords(nt, coord)
+    tex = polyhaven_texture(pbr) if pbr else None
     col = tuple(base)
-    if var is not None:
+    t_rough = t_height = None
+    if tex:
+        t_col, t_rough, t_height = _pbr_box(nt, vec, tex)
+        col = _mix(nt, "MULTIPLY", 1.0, t_col, tuple(tint), (-850, 450))
+        if var is not None:
+            ratio = tuple(clamp(v / max(b, 1e-3), 0.3, 1.6) for v, b in zip(var, base))
+            f = _noise(nt, vec, var_scale, 5.0, 0.6, (-1100, 300))
+            col = _mix(nt, "MULTIPLY", 1.0, col, _ramp(nt, f, [(0.35, (1, 1, 1)), (0.65, ratio)], (-850, 300)))
+        checker = None
+        if patches is not None:   # bare patches keep the photo detail, recoloured
+            patches = (patches[0], patches[1],
+                       _mix(nt, "MULTIPLY", 1.0, t_col, tuple(min(1.0, c * 1.5) for c in patches[2])))
+        if band is not None:
+            band = (band[0], _mix(nt, "MULTIPLY", 1.0, t_col, tuple(min(1.0, c * 1.6) for c in band[1])))
+    elif var is not None:
         f = _noise(nt, vec, var_scale, 5.0, 0.6, (-1100, 300))
         col = _ramp(nt, f, [(0.35, base), (0.65, var)], (-850, 300))
     if checker is not None:
@@ -544,7 +766,11 @@ def mat_surface(name, base, var=None, var_scale=1.5, rough=0.6, rough_var=0.15,
         mask = _math(nt, "GREATER_THAN", sc, 1.0 - 0.18 * scratches, loc=(-850, -600))
         col = _mix(nt, "MIX", mask, col, (0.42, 0.42, 0.43), (-100, 0))
         metal_in = _math(nt, "MAXIMUM", mask, metal, loc=(-600, -650))
-        rough_in = _math(nt, "SUBTRACT", rough, _math(nt, "MULTIPLY", mask, 0.3, loc=(-600, -750)), loc=(-400, -700))
+        rough_in = _math(nt, "SUBTRACT", rough if t_rough is None else t_rough,
+                         _math(nt, "MULTIPLY", mask, 0.3, loc=(-600, -750)),
+                         loc=(-400, -700))
+    elif t_rough is not None:
+        rough_in = t_rough
     elif rough_var > 0:
         rn = _noise(nt, vec, 6.0, 3.0, 0.5, (-1100, -900))
         rough_in = _math(nt, "ADD", rough - rough_var / 2,
@@ -557,7 +783,13 @@ def mat_surface(name, base, var=None, var_scale=1.5, rough=0.6, rough_var=0.15,
     if emission is not None:
         _feed(nt, _in(bsdf, "Emission Color", "Emission"), emission)
         _feed(nt, _in(bsdf, "Emission Strength"), emission_strength)
-    if bump > 0:
+    if t_height is not None and pbr_bump > 0:
+        bn = _node(nt, "ShaderNodeBump", (0, -400))
+        bn.inputs["Strength"].default_value = pbr_bump
+        _feed(nt, _in(bn, "Distance"), 0.01 * tex["size"])
+        nt.links.new(t_height, bn.inputs["Height"])
+        nt.links.new(bn.outputs["Normal"], bsdf.inputs["Normal"])
+    elif bump > 0:
         b = _noise(nt, vec, bump_scale, 10.0, 0.6, (-400, -400))
         bn = _node(nt, "ShaderNodeBump", (0, -400))
         bn.inputs["Strength"].default_value = bump
@@ -568,31 +800,81 @@ def mat_surface(name, base, var=None, var_scale=1.5, rough=0.6, rough_var=0.15,
     return mat
 
 
+def _pbr_box(nt, vec, tex, loc=(-1150, 650)):
+    """Box-projected image maps at the texture's real-world size.
+    Returns (colour, roughness, height) sockets; missing maps are None."""
+    vec = _scale_vec(nt, vec, (1.0 / tex["size"],) * 3, (loc[0] - 220, loc[1]))
+    outs = []
+    for i, (key, data) in enumerate((("diff", False), ("rough", True), ("height", True))):
+        if key not in tex:
+            outs.append(None)
+            continue
+        n = _node(nt, "ShaderNodeTexImage", (loc[0], loc[1] - 280 * i))
+        n.image = load_image(tex[key], data)
+        n.projection = "BOX"
+        n.projection_blend = 0.25
+        nt.links.new(vec, n.inputs["Vector"])
+        outs.append(n.outputs["Color"])
+    return outs
+
+
+def mat_arc_metal(name, shade, wear=1.0):
+    """ARC armour: Poly Haven painted metal (UV mapped) recoloured to dark
+    gunmetal, with bevelled edges worn to bare steel and grime in crevices."""
+    tex = polyhaven_texture(POLYHAVEN_TEX["arc_metal"])
+    if not tex or "nor" not in tex:
+        return mat_surface(name, shade, var=tuple(c * 1.4 for c in shade), var_scale=2.5, rough=0.42,
+                           metal=0.65, coord="rest", grime=0.4, scratches=wear, bump=0.06, bump_scale=30.0)
+    mat, nt, out = _new_material(name)
+    bsdf = _node(nt, "ShaderNodeBsdfPrincipled", (400, 0))
+    uv = _node(nt, "ShaderNodeTexCoord", (-1500, 0)).outputs["UV"]
+
+    def img(key, data, y):
+        n = _node(nt, "ShaderNodeTexImage", (-1250, y))
+        n.image = load_image(tex[key], data)
+        nt.links.new(uv, n.inputs["Vector"])
+        return n.outputs["Color"]
+
+    lum = _node(nt, "ShaderNodeRGBToBW", (-1000, 300))
+    nt.links.new(img("diff", False, 300), lum.inputs[0])
+    paint = _ramp(nt, lum.outputs[0], [(0.1, tuple(c * 0.55 for c in shade)), (0.45, shade),
+                                       (0.9, tuple(c * 1.9 for c in shade))], (-800, 300))
+    nmap = _node(nt, "ShaderNodeNormalMap", (-1000, -300))
+    nmap.inputs["Strength"].default_value = 0.8
+    nt.links.new(img("nor", True, -300), nmap.inputs["Color"])
+    bevel = _node(nt, "ShaderNodeBevel", (-750, -300))
+    bevel.inputs["Radius"].default_value = 0.02
+    nt.links.new(nmap.outputs["Normal"], bevel.inputs["Normal"])
+    geo = _node(nt, "ShaderNodeNewGeometry", (-750, -550))
+    dot = _node(nt, "ShaderNodeVectorMath", (-550, -450), operation="DOT_PRODUCT")
+    nt.links.new(bevel.outputs["Normal"], dot.inputs[0])
+    nt.links.new(geo.outputs["Normal"], dot.inputs[1])
+    edge = _math(nt, "MULTIPLY", _math(nt, "SUBTRACT", 1.0, dot.outputs["Value"], loc=(-400, -450)),
+                 14.0, clamp_=True, loc=(-250, -450))
+    chips = _noise(nt, uv, 18.0, 6.0, 0.7, (-550, -700))
+    worn = _math(nt, "GREATER_THAN", _math(nt, "MULTIPLY", edge, chips, loc=(-250, -650)),
+                 0.55 - 0.25 * wear, loc=(-100, -600))
+    ao = _node(nt, "ShaderNodeAmbientOcclusion", (-550, 650))
+    ao.inputs["Distance"].default_value = 0.35
+    dirt = _ramp(nt, ao.outputs["AO"], [(0.3, (0.45, 0.4, 0.33)), (0.85, (1, 1, 1))], (-350, 650))
+    col = _mix(nt, "MULTIPLY", 1.0, paint, dirt, (-350, 300))
+    col = _mix(nt, "MIX", worn, col, (0.36, 0.36, 0.37), (-100, 250))
+    rough = _math(nt, "ADD", 0.28, _math(nt, "MULTIPLY", img("rough", True, 0), 0.35, loc=(-1000, 0)),
+                  loc=(-800, 0))
+    _feed(nt, _in(bsdf, "Base Color"), col)
+    _feed(nt, _in(bsdf, "Metallic"), _math(nt, "ADD", 0.55, _math(nt, "MULTIPLY", worn, 0.45, loc=(0, -150)),
+                                          loc=(150, -150)))
+    _feed(nt, _in(bsdf, "Roughness"), _mix(nt, "MIX", worn, rough, (0.22, 0.22, 0.22), (150, 0)))
+    nt.links.new(bevel.outputs["Normal"], bsdf.inputs["Normal"])
+    nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
+    return mat
+
+
 def mat_emit(name, color, strength):
     mat, nt, out = _new_material(name)
     em = _node(nt, "ShaderNodeEmission", (200, 0))
     em.inputs["Color"].default_value = tuple(color) + (1.0,)
     em.inputs["Strength"].default_value = strength
-    nt.links.new(em.outputs[0], out.inputs["Surface"])
-    return mat
-
-
-def mat_eye(name):
-    """Glowing ARC optic: hot core fading to deep red at the rim."""
-    mat, nt, out = _new_material(name)
-    sep = _node(nt, "ShaderNodeSeparateXYZ", (-700, 0))
-    nt.links.new(_coords(nt, "rest", (-900, 0)), sep.inputs[0])
-    # The optic faces +Y in the rest pose; radial distance in the XZ plane.
-    comb = _node(nt, "ShaderNodeCombineXYZ", (-500, 0))
-    nt.links.new(sep.outputs["X"], comb.inputs["X"])
-    nt.links.new(_math(nt, "SUBTRACT", sep.outputs["Z"], 0.06 * 1.2, loc=(-600, -150)), comb.inputs["Y"])
-    ln = _node(nt, "ShaderNodeVectorMath", (-300, 0), operation="LENGTH")
-    nt.links.new(comb.outputs[0], ln.inputs[0])
-    col = _ramp(nt, _math(nt, "DIVIDE", ln.outputs["Value"], 0.25 * 1.2, loc=(-150, 0)),
-                [(0.0, (1.0, 0.75, 0.45)), (0.25, (1.0, 0.18, 0.03)), (1.0, (0.55, 0.01, 0.0))], (0, 0))
-    em = _node(nt, "ShaderNodeEmission", (250, 0))
-    nt.links.new(col, em.inputs["Color"])
-    em.inputs["Strength"].default_value = 45.0
     nt.links.new(em.outputs[0], out.inputs["Surface"])
     return mat
 
@@ -630,25 +912,30 @@ def build_materials():
     M["plaster"] = mat_surface("ARC_Plaster", (0.8, 0.62, 0.43), var=(0.7, 0.45, 0.32),
                                var_scale=0.3, rough=0.9, coord="rest", grime=0.35,
                                streaks=0.6, patches=(0.9, 0.66, (0.5, 0.47, 0.43)),
-                               bump=0.2, bump_scale=5.0)
+                               bump=0.2, bump_scale=5.0, pbr=POLYHAVEN_TEX["plaster"], tint=(0.98, 0.8, 0.6),
+                               pbr_bump=0.8)
     M["paint"] = mat_surface("ARC_InteriorPaint", (0.66, 0.62, 0.52), var=(0.55, 0.52, 0.44),
                              var_scale=1.2, rough=0.8, coord="rest", grime=0.5, streaks=0.5,
-                             band=(FLOOR2 + 1.15, (0.17, 0.34, 0.33)), bump=0.1)
+                             band=(FLOOR2 + 1.15, (0.17, 0.34, 0.33)), bump=0.1,
+                             pbr=POLYHAVEN_TEX["paint"], tint=(0.95, 0.88, 0.74))
     M["concrete"] = mat_surface("ARC_Concrete", (0.44, 0.42, 0.39), var=(0.3, 0.29, 0.27),
                                 var_scale=2.0, rough=0.92, coord="rest", grime=0.3, bump=0.45,
-                                bump_scale=14.0)
+                                bump_scale=14.0, pbr=POLYHAVEN_TEX["concrete"], pbr_bump=0.8)
     M["tiles"] = mat_surface("ARC_FloorTiles", (0.56, 0.5, 0.43), var=(0.62, 0.53, 0.4),
                              var_scale=0.8, rough=0.55, coord="rest", grime=0.55,
-                             checker=(1.6, (0.33, 0.3, 0.27)), bump=0.08)
+                             checker=(1.6, (0.33, 0.3, 0.27)), bump=0.08,
+                             pbr=POLYHAVEN_TEX["tiles"], tint=(0.95, 0.88, 0.78), pbr_bump=0.3)
     M["sand"] = mat_surface("ARC_Sand", (0.78, 0.6, 0.41), var=(0.66, 0.49, 0.33),
-                            var_scale=0.08, rough=0.95, rough_var=0.0, bump=0.35, bump_scale=2.5)
+                            var_scale=0.08, rough=0.95, rough_var=0.0, bump=0.35, bump_scale=2.5,
+                            pbr=POLYHAVEN_TEX["sand"], tint=(1.05, 0.95, 0.85), pbr_bump=0.6)
     M["shutter"] = mat_surface("ARC_ShutterPaint", (0.12, 0.36, 0.36), var=(0.36, 0.3, 0.22),
                                var_scale=3.0, rough=0.7, grime=0.4, streaks=0.4, bump=0.1)
     M["window"] = mat_surface("ARC_DarkWindow", (0.012, 0.012, 0.014), rough=0.25, rough_var=0.1, bump=0.0)
     M["rust"] = mat_surface("ARC_Rust", (0.32, 0.13, 0.05), var=(0.18, 0.09, 0.05), var_scale=4.0,
-                            rough=0.85, metal=0.3, grime=0.3, bump=0.3, bump_scale=20.0)
+                            rough=0.85, metal=0.3, grime=0.3, bump=0.3, bump_scale=20.0,
+                            pbr=POLYHAVEN_TEX["rust"], tint=(0.8, 0.7, 0.62))
     M["wood"] = mat_surface("ARC_Wood", (0.36, 0.23, 0.13), var=(0.24, 0.15, 0.08), var_scale=6.0,
-                            rough=0.75, grime=0.3, bump=0.1)
+                            rough=0.75, grime=0.3, bump=0.1, pbr=POLYHAVEN_TEX["wood"])
     M["fabric"] = mat_surface("ARC_OldFabric", (0.48, 0.42, 0.33), var=(0.36, 0.3, 0.22),
                               var_scale=3.0, rough=0.95, grime=0.4, bump=0.1)
     M["rug"] = mat_surface("ARC_Rug", (0.42, 0.1, 0.07), var=(0.3, 0.2, 0.12), var_scale=5.0,
@@ -658,20 +945,18 @@ def build_materials():
     M["sign_text"] = mat_surface("ARC_SignLetters", (0.45, 0.07, 0.05), var=(0.28, 0.12, 0.07),
                                  var_scale=3.0, rough=0.6, grime=0.3)
     # Leaper
+    M["arc_armor"] = mat_arc_metal("ARC_Armor", (0.07, 0.075, 0.08), wear=1.0)
+    M["arc_mech"] = mat_arc_metal("ARC_Mechanics", (0.035, 0.036, 0.038), wear=0.4)
+    M["eye_ring"] = mat_emit("ARC_Eye_Ring", (1.0, 0.025, 0.008), 28.0)
+    M["eye_lens"] = mat_surface("ARC_Eye_Lens", (0.006, 0.006, 0.007), rough=0.04, rough_var=0.0,
+                                metal=0.0, coat=1.0, bump=0.0)
     M["arc_dark"] = mat_surface("ARC_Armor_Dark", (0.07, 0.075, 0.08), var=(0.11, 0.095, 0.08),
                                 var_scale=2.5, rough=0.42, metal=0.65, coord="rest", grime=0.4,
                                 scratches=1.0, bump=0.06, bump_scale=30.0)
-    M["arc_plate"] = mat_surface("ARC_Armor_Plate", (0.4, 0.4, 0.37), var=(0.3, 0.21, 0.14),
-                                 var_scale=1.8, rough=0.55, metal=0.2, coord="rest", grime=0.55,
-                                 streaks=0.6, scratches=0.8, bump=0.05, bump_scale=25.0)
-    M["arc_accent"] = mat_surface("ARC_Armor_Accent", (0.62, 0.16, 0.04), var=(0.3, 0.12, 0.06),
-                                  var_scale=2.5, rough=0.5, metal=0.2, coord="rest", grime=0.4,
-                                  scratches=1.0, bump=0.05, bump_scale=25.0)
     M["arc_joint"] = mat_surface("ARC_Joint", (0.025, 0.025, 0.027), rough=0.55, metal=0.4,
                                  coord="rest", grime=0.2, bump=0.05, bump_scale=40.0)
     M["chrome"] = mat_surface("ARC_Piston", (0.75, 0.74, 0.72), rough=0.2, metal=1.0, coord="rest",
                               grime=0.35, bump=0.0)
-    M["eye"] = mat_eye("ARC_Eye")
     M["arc_light"] = mat_emit("ARC_Lights", (1.0, 0.16, 0.03), 30.0)
     M["arc_core"] = mat_emit("ARC_Core", (1.0, 0.32, 0.05), 7.0)
     # Raider
@@ -701,6 +986,8 @@ def build_materials():
     M["haze"] = mat_volume("FX_Haze", (0.9, 0.78, 0.64), 0.002, anisotropy=0.45)
     M["room_dust"] = mat_volume("FX_RoomDust", (0.85, 0.78, 0.68), 0.014, anisotropy=0.55)
     M["bulb"] = mat_emit("Lamp_Bulb", (1.0, 0.72, 0.4), 12.0)
+    for mat in M.values():      # MPFB purges orphan data while building the human
+        mat.use_fake_user = True
     return M
 
 
@@ -721,6 +1008,10 @@ def classify_face(c, n):
 # Environment: sky, sun, sand, distant ruins, props outside
 # =============================================================================
 def build_world(scene):
+    """Sky: the Poly Haven desert HDRI when available (rotated so its sun
+    lines up with the scene's sun lamp, sun disc clamped so the lamp stays the
+    single sharp key light), otherwise a physical sky texture.
+    Returns the direction towards the sun."""
     world = bpy.data.worlds.new("ARC_Sky")
     scene.world = world
     if world.node_tree is None:
@@ -730,6 +1021,29 @@ def build_world(scene):
         nt.nodes.remove(n)
     out = _node(nt, "ShaderNodeOutputWorld", (400, 0))
     bg = _node(nt, "ShaderNodeBackground", (200, 0))
+    hdri = polyhaven_hdri(HDRI_ID)
+    if hdri:
+        img = load_image(hdri)
+        h_az, h_el = hdri_sun(img)
+        target_az = math.atan2(SUN_TO.y, SUN_TO.x)
+        tc = _node(nt, "ShaderNodeTexCoord", (-900, 0))
+        mp = _node(nt, "ShaderNodeMapping", (-700, 0))
+        mp.inputs["Rotation"].default_value = (0.0, 0.0, h_az - target_az)
+        nt.links.new(tc.outputs["Generated"], mp.inputs["Vector"])
+        env = _node(nt, "ShaderNodeTexEnvironment", (-500, 0))
+        env.image = img
+        nt.links.new(mp.outputs["Vector"], env.inputs["Vector"])
+        lum = _node(nt, "ShaderNodeRGBToBW", (-300, -200))
+        nt.links.new(env.outputs["Color"], lum.inputs[0])
+        keep = _math(nt, "MINIMUM", _math(nt, "DIVIDE", 25.0, _math(nt, "MAXIMUM", lum.outputs[0], 1e-4,
+                                                                         loc=(-150, -200)), loc=(0, -200)),
+                     1.0, loc=(100, -200))
+        col = _mix(nt, "MULTIPLY", 1.0, env.outputs["Color"], keep, (50, 0))
+        nt.links.new(col, bg.inputs["Color"])
+        bg.inputs["Strength"].default_value = 0.9
+        nt.links.new(bg.outputs[0], out.inputs["Surface"])
+        el = clamp(h_el, math.radians(6.0), math.radians(25.0))
+        return Vector((math.cos(target_az) * math.cos(el), math.sin(target_az) * math.cos(el), math.sin(el)))
     sky = _node(nt, "ShaderNodeTexSky", (0, 0))
     for kind in ("NISHITA", "SINGLE_SCATTERING", "MULTIPLE_SCATTERING", "HOSEK_WILKIE"):
         try:
@@ -752,15 +1066,16 @@ def build_world(scene):
     nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
     bg.inputs["Strength"].default_value = 0.22
     nt.links.new(bg.outputs[0], out.inputs["Surface"])
+    return SUN_TO
 
 
-def build_sun(cols):
+def build_sun(cols, sun_to=SUN_TO):
     data = bpy.data.lights.new("Sun", "SUN")
     data.energy = 4.2
     data.color = (1.0, 0.76, 0.52)
     data.angle = math.radians(1.5)
     sun = bpy.data.objects.new("Sun", data)
-    sun.rotation_euler = (-SUN_TO).to_track_quat("-Z", "Y").to_euler()
+    sun.rotation_euler = (-sun_to).to_track_quat("-Z", "Y").to_euler()
     cols["Lights"].objects.link(sun)
     return sun
 
@@ -1343,7 +1658,8 @@ def pole_angle(hip, knee, foot, pole, x_axis):
     if x_axis.cross(projected).angle(chain) < 1.0:
         ang = -ang
     return ang
-LEAPER_MATS = ("arc_dark", "arc_plate", "arc_joint", "chrome", "eye", "arc_light", "arc_core", "arc_accent")
+LEAPER_MATS = ("arc_armor", "arc_mech", "arc_joint", "chrome", "eye_ring", "arc_light", "arc_core", "eye_lens")
+LEAPER_TEX_TILE = 1.6     # metres per repeat of the painted-metal texture
 
 
 class Skin:
@@ -1361,58 +1677,104 @@ class Skin:
             v[self.dl][gi] = 1.0
 
 
-def leaper_geometry(sk):
-    bm = sk.bm
-    D, L, J, C, EYE, LITE, CORE, ACC = range(8)
-    R = lambda x=0.0, y=0.0, z=0.0: Euler((math.radians(x), math.radians(y), math.radians(z)))
-    # ---- chassis (bone: body) ----
-    sk(bm_box(bm, (0, 0.1, 0.0), (1.55, 2.3, 0.8), mat=D), "body")
-    sk(bm_beam(bm, (0, 1.2, -0.05), (0, 1.0, -0.05), 1.0, 0.55, 1.55, 0.8, mat=D), "body")
-    for i, (y, w) in enumerate(((0.8, 1.7), (0.05, 1.82), (-0.7, 1.72))):
-        sk(bm_box(bm, (0, y, 0.46 + 0.03 * i), (w, 0.88, 0.1), rot=R(-7), mat=L), "body")
-        sk(bm_box(bm, (0, y - 0.1, 0.53 + 0.03 * i), (0.22, 0.5, 0.06), rot=R(-7), mat=ACC), "body")
-    for s in (-1, 1):
-        sk(bm_box(bm, (s * 0.86, 0.05, -0.08), (0.1, 2.0, 0.55), rot=R(0, s * -14), mat=L), "body")
-        for k in range(3):
-            sk(bm_box(bm, (s * 0.93, -0.55 + k * 0.55, 0.0), (0.04, 0.3, 0.08), rot=R(0, s * -14), mat=LITE if k == 1 else J), "body")
-    sk(bm_box(bm, (0, 0.0, -0.52), (1.1, 1.8, 0.28), mat=J), "body")
-    for y in (-0.55, 0.0, 0.55):
-        sk(bm_cyl(bm, (-0.48, y, -0.66), (0.48, y, -0.66), 0.08, segs=12, mat=C), "body")
-    # rear segment with the glowing core vent
-    sk(bm_box(bm, (0, -1.55, 0.12), (1.25, 1.2, 0.85), rot=R(12), mat=D), "body")
-    sk(bm_box(bm, (0, -1.6, 0.6), (1.32, 1.1, 0.1), rot=R(16), mat=L), "body")
-    sk(bm_cyl(bm, (0, -2.08, 0.05), (0, -2.2, 0.05), 0.33, segs=24, mat=J), "body")
-    sk(bm_cyl(bm, (0, -2.18, 0.05), (0, -2.23, 0.05), 0.25, segs=24, mat=CORE), "body")
-    for z in (-0.1, 0.05, 0.2):
-        sk(bm_box(bm, (0, -2.25, z), (0.52, 0.03, 0.035), mat=J), "body")
-    for s in (-1, 1):
-        sk(bm_cyl(bm, (s * 0.42, -1.85, 0.45), (s * 0.5, -2.3, 1.05), 0.1, 0.075, segs=12, mat=J), "body")
-        sk(bm_cyl(bm, (s * 0.3, -1.2, 0.55), (s * 0.48, -1.95, 2.0), 0.02, 0.008, segs=6, mat=C), "body")
-        sk(bm_sphere(bm, (s * 0.48, -1.95, 2.0), 0.03, mat=LITE), "body")
-    # hip turrets
-    for hip, _, _, _ in LEGS.values():
-        h = Vector(hip)
-        sk(bm_cyl(bm, h - Vector((0, 0, 0.27)), h + Vector((0, 0, 0.27)), 0.31, segs=20, mat=J), "body")
-        sk(bm_cyl(bm, h + Vector((0, 0, 0.27)), h + Vector((0, 0, 0.36)), 0.27, 0.2, segs=20, mat=L), "body")
+# Chamfered octagon used for the armour shells (x across, y up), unit size.
+ARMOR_PROFILE = [(-0.5, -0.2), (-0.32, -0.5), (0.32, -0.5), (0.5, -0.2),
+                 (0.5, 0.18), (0.3, 0.5), (-0.3, 0.5), (-0.5, 0.18)]
 
-    # ---- head (bone: head) ----
-    sk(bm_cyl(bm, (0, 0.95, 0.0), (0, 1.45, 0.05), 0.34, segs=16, mat=J), "head")
-    sk(bm_beam(bm, (0, 1.3, 0.05), (0, 2.12, 0.02), 1.18, 0.9, 0.92, 0.72, mat=D), "head")
-    sk(bm_box(bm, (0, 1.72, 0.5), (1.06, 0.86, 0.1), rot=R(-10), mat=L), "head")
-    sk(bm_box(bm, (0, 1.62, 0.57), (0.18, 0.6, 0.06), rot=R(-10), mat=ACC), "head")
-    for s in (-1, 1):
-        sk(bm_box(bm, (s * 0.56, 1.72, -0.02), (0.08, 0.72, 0.58), rot=R(0, 0, s * 8), mat=L), "head")
-        sk(bm_sphere(bm, (s * 0.44, 2.1, 0.33), 0.05, mat=LITE), "head")
-        sk(bm_sphere(bm, (s * 0.52, 2.0, 0.18), 0.035, mat=LITE), "head")
-        sk(bm_cyl(bm, (s * 0.3, 2.0, -0.3), (s * 0.17, 2.6, -0.66), 0.08, 0.008, segs=8, mat=C), "head")
-    eye = Vector((0, 2.14, 0.06))
-    sk(bm_cyl(bm, eye, eye + Vector((0, 0.1, 0)), 0.37, segs=32, mat=J), "head")
-    sk(bm_cyl(bm, eye + Vector((0, 0.05, 0)), eye + Vector((0, 0.13, 0)), 0.26, segs=32, mat=EYE), "head")
-    sk(bm_sphere(bm, eye + Vector((0, 0.12, 0)), 0.15, segs=24, rings=12, scale=(1, 0.45, 1), mat=EYE), "head")
-    for k in range(3):   # the three armoured eye plates around the optic
-        a = math.radians(90 + 120 * k)
-        c = eye + Vector((math.cos(a) * 0.42, 0.13, math.sin(a) * 0.42))
-        sk(bm_box(bm, c, (0.4, 0.07, 0.17), rot=Euler((0.0, -(a + math.pi / 2), 0.0)), mat=ACC), "head")
+
+def bm_loft(bm, p0, p1, stations, up=(0, 0, 1), profile=ARMOR_PROFILE, mat=0):
+    """Faceted armour shell along p0->p1. stations: (u, width, height, lift),
+    u = fraction along the axis (may overshoot), lift = offset along `up`."""
+    p0, p1 = Vector(p0), Vector(p1)
+    _, side, upn = beam_frame(p0, p1, up)
+    rings = []
+    for u, w, h, lift in stations:
+        c = p0.lerp(p1, u) + upn * lift
+        rings.append([bm.verts.new(c + side * px * w + upn * py * h) for px, py in profile])
+    n = len(profile)
+    faces = [bm.faces.new(list(reversed(rings[0]))), bm.faces.new(rings[-1])]
+    for a, b in zip(rings, rings[1:]):
+        for i in range(n):
+            j = (i + 1) % n
+            faces.append(bm.faces.new((a[i], a[j], b[j], b[i])))
+    for f in faces:
+        f.material_index = mat
+    bmesh.ops.recalc_face_normals(bm, faces=faces)
+    return [v for r in rings for v in r]
+
+
+def cube_uv(bm, tile):
+    """Per-face box projection of the (rest pose) coordinates, `tile` metres
+    per texture repeat. Parts are rigid per bone, so the UVs stick."""
+    uv = bm.loops.layers.uv.verify()
+    for f in bm.faces:
+        n = f.normal
+        ax = max(range(3), key=lambda i: abs(n[i]))
+        a, b = [(1, 2), (0, 2), (0, 1)][ax]
+        sgn = 1.0 if n[ax] >= 0 else -1.0
+        for loop in f.loops:
+            co = loop.vert.co
+            loop[uv].uv = (co[a] * sgn / tile, co[b] / tile)
+
+
+def leaper_geometry(sk):
+    """The Leaper as seen in ARC Raiders key art: a compact armoured core
+    with one big bolted optic (black lens, glowing red ring) and four
+    massive faceted legs - high angular knees, long tapering shins and
+    piston feet. Authored at 1/LEAPER_SCALE size, +Y forward."""
+    bm = sk.bm
+    A, MECH, J, C, RING, LITE, CORE, LENS = range(8)
+    # ---- core hull (bone: body) ----
+    sk(bm_loft(bm, (0, -1.55, 0.05), (0, 1.25, 0.05),
+               [(0.0, 0.8, 0.7, 0.05), (0.12, 1.45, 1.1, 0.05), (0.45, 1.85, 1.35, 0.0),
+                (0.8, 1.75, 1.3, -0.02), (1.0, 1.3, 1.05, -0.05)], mat=A), "body")
+    for y0, y1, w in ((-1.15, -0.1, 1.15), (0.0, 0.95, 1.2)):        # dorsal armour plates
+        sk(bm_loft(bm, (0, y0, 0.72), (0, y1, 0.66),
+                   [(-0.04, w * 0.8, 0.16, 0.0), (0.15, w, 0.24, 0.0), (0.85, w, 0.24, 0.0),
+                    (1.04, w * 0.8, 0.16, 0.0)], mat=A), "body")
+    sk(bm_loft(bm, (0, -0.9, 0.86), (0, 0.6, 0.84),
+               [(0.0, 0.1, 0.12, 0.0), (0.2, 0.16, 0.3, 0.05), (1.0, 0.12, 0.2, 0.0)], mat=MECH), "body")
+    sk(bm_box(bm, (0, -0.1, -0.6), (1.2, 2.0, 0.35), mat=MECH), "body")           # belly machinery
+    for y in (-0.6, 0.0, 0.6):
+        sk(bm_cyl(bm, (-0.55, y, -0.78), (0.55, y, -0.78), 0.09, segs=12, mat=C), "body")
+    for x in (-0.35, 0.35):
+        sk(bm_cyl(bm, (x, -0.9, -0.62), (x, 0.7, -0.72), 0.05, segs=8, mat=J), "body")
+    sk(bm_cyl(bm, (0, -1.5, 0.05), (0, -1.68, 0.05), 0.36, segs=24, mat=MECH), "body")   # rear vent
+    sk(bm_cyl(bm, (0, -1.66, 0.05), (0, -1.7, 0.05), 0.26, segs=24, mat=CORE), "body")
+    for z in (-0.1, 0.05, 0.2):
+        sk(bm_box(bm, (0, -1.72, z), (0.56, 0.03, 0.035), mat=MECH), "body")
+    for sx in (-1, 1):
+        sk(bm_cyl(bm, (sx * 0.3, -1.0, 0.8), (sx * 0.38, -1.25, 1.55), 0.025, 0.012, segs=6, mat=C), "body")
+        sk(bm_sphere(bm, (sx * 0.38, -1.25, 1.56), 0.035, mat=LITE), "body")
+        sk(bm_sphere(bm, (sx * 0.62, 0.95, 0.42), 0.045, mat=LITE), "body")
+    for hip, _, _, _ in LEGS.values():                                  # hip sockets
+        h = Vector(hip)
+        out = Vector((math.copysign(1.0, h.x), 0, 0))
+        sk(bm_sphere(bm, h, 0.46, segs=20, rings=10, mat=MECH), "body")
+        sk(bm_cyl(bm, h - out * 0.28, h + out * 0.02, 0.56, 0.5, segs=8, mat=A), "body")
+        for k in range(6):                                              # bolt ring
+            a = 2 * math.pi * k / 6
+            b = h + out * 0.03 + Vector((0, math.cos(a) * 0.42, math.sin(a) * 0.42))
+            sk(bm_cyl(bm, b - out * 0.02, b + out * 0.03, 0.035, segs=6, mat=C), "body")
+
+    # ---- optic turret (bone: head) ----
+    eye = Vector((0, 1.62, 0.0))
+    sk(bm_cyl(bm, (0, 1.0, 0.0), (0, 1.36, 0.0), 0.72, segs=24, mat=MECH), "head")
+    sk(bm_cyl(bm, (0, 1.3, 0.0), eye, 0.7, 0.68, segs=24, mat=A), "head")
+    sk(bm_cyl(bm, eye, eye + Vector((0, 0.06, 0)), 0.68, 0.6, segs=24, mat=A), "head")
+    sk(bm_cyl(bm, eye + Vector((0, 0.055, 0)), eye + Vector((0, 0.07, 0)), 0.53, segs=32, mat=J), "head")
+    sk(bm_cyl(bm, eye + Vector((0, 0.065, 0)), eye + Vector((0, 0.08, 0)), 0.45, segs=40, mat=RING), "head")
+    sk(bm_sphere(bm, eye + Vector((0, 0.08, 0)), 0.37, segs=32, rings=16, scale=(1, 0.42, 1), mat=LENS), "head")
+    for k in range(12):
+        a = 2 * math.pi * (k + 0.5) / 12
+        b = eye + Vector((math.cos(a) * 0.6, 0.06, math.sin(a) * 0.6))
+        sk(bm_cyl(bm, b, b + Vector((0, 0.035, 0)), 0.03, segs=6, mat=C), "head")
+    sk(bm_loft(bm, (0, 0.95, 0.62), (0, 1.75, 0.5),                     # brow armour over the optic
+               [(0.0, 1.25, 0.2, 0.0), (0.6, 1.3, 0.26, 0.02), (1.0, 1.05, 0.16, -0.04)], mat=A), "head")
+    for sx in (-1, 1):
+        sk(bm_loft(bm, (sx * 0.62, 1.05, -0.05), (sx * 0.6, 1.62, -0.12),     # cheek guards
+                   [(0.0, 0.16, 0.7, 0.0), (1.0, 0.12, 0.5, 0.0)], up=(0, 0, 1), mat=A), "head")
+        sk(bm_sphere(bm, (sx * 0.5, 1.7, 0.38), 0.035, mat=LITE), "head")
 
     # ---- legs (bones: femur.X, tibia.X) ----
     for name, (hip, knee, foot, _) in LEGS.items():
@@ -1422,30 +1784,36 @@ def leaper_geometry(sk):
         outward = Vector((math.copysign(1.0, hip.x), 0.35 * math.copysign(1.0, hip.y), 0.0)).normalized()
         if n.dot(outward) < 0:
             n = -n
-        # femur
-        sk(bm_beam(bm, hip, knee, 0.5, 0.56, 0.36, 0.42, mat=D), fem)
+        # femur: a bulky armoured shell rising to the knee, hydraulics below
+        sk(bm_loft(bm, hip, knee, [(-0.06, 0.52, 0.52, 0.0), (0.12, 0.74, 0.72, 0.06),
+                                   (0.55, 0.84, 0.8, 0.1), (0.88, 0.78, 0.74, 0.06),
+                                   (1.04, 0.6, 0.56, 0.0)], mat=A), fem)
         _, side, upn = beam_frame(hip, knee, (0, 0, 1))
-        sk(bm_beam(bm, hip.lerp(knee, 0.1) + upn * 0.32, hip.lerp(knee, 0.88) + upn * 0.25,
-                   0.62, 0.09, 0.48, 0.09, mat=L), fem)
-        sk(bm_beam(bm, hip.lerp(knee, 0.3) + upn * 0.38, hip.lerp(knee, 0.62) + upn * 0.35,
-                   0.16, 0.05, 0.14, 0.05, mat=ACC), fem)
-        p0, p1 = hip.lerp(knee, 0.18) - upn * 0.36, hip.lerp(knee, 0.82) - upn * 0.29
-        sk(bm_cyl(bm, p0, p0.lerp(p1, 0.55), 0.09, segs=12, mat=J), fem)
-        sk(bm_cyl(bm, p0.lerp(p1, 0.5), p1, 0.05, segs=12, mat=C), fem)
-        sk(bm_cyl(bm, knee - n * 0.36, knee + n * 0.36, 0.31, segs=24, mat=J), fem)
-        sk(bm_cyl(bm, knee + n * 0.36, knee + n * 0.4, 0.13, segs=16, mat=LITE), fem)
-        sk(bm_cyl(bm, knee - n * 0.4, knee - n * 0.36, 0.2, segs=16, mat=C), fem)
-        # tibia + three armour plates + spike
-        t_end = knee.lerp(foot, 0.86)
-        sk(bm_beam(bm, knee, t_end, 0.42, 0.5, 0.19, 0.22, up=outward, mat=D), tib)
-        _, side, upt = beam_frame(knee, t_end, outward)
-        for u0, u1 in ((0.06, 0.3), (0.35, 0.58), (0.63, 0.82)):
-            h0, h1 = 0.5 + (0.22 - 0.5) * u0 / 0.86, 0.5 + (0.22 - 0.5) * u1 / 0.86
-            w0, w1 = 0.42 + (0.19 - 0.42) * u0 / 0.86, 0.42 + (0.19 - 0.42) * u1 / 0.86
-            sk(bm_beam(bm, knee.lerp(foot, u0) + upt * (h0 / 2 + 0.04), knee.lerp(foot, u1) + upt * (h1 / 2 + 0.04),
-                       w0 + 0.14, 0.07, w1 + 0.1, 0.07, up=outward, mat=L), tib)
-        sk(bm_cyl(bm, knee.lerp(foot, 0.4) - upt * 0.15, knee.lerp(foot, 0.7) - upt * 0.1, 0.03, segs=8, mat=C), tib)
-        sk(bm_cyl(bm, t_end, foot, 0.12, 0.004, segs=12, mat=C), tib)
+        sk(bm_loft(bm, hip.lerp(knee, 0.3) + upn * 0.47, hip.lerp(knee, 0.8) + upn * 0.44,
+                   [(0.0, 0.3, 0.08, 0.0), (0.1, 0.42, 0.12, 0.0), (0.9, 0.42, 0.12, 0.0),
+                    (1.0, 0.3, 0.08, 0.0)], mat=MECH), fem)
+        p0, p1 = hip.lerp(knee, 0.15) - upn * 0.45, hip.lerp(knee, 0.85) - upn * 0.38
+        sk(bm_cyl(bm, p0, p0.lerp(p1, 0.55), 0.12, segs=12, mat=MECH), fem)
+        sk(bm_cyl(bm, p0.lerp(p1, 0.5), p1, 0.065, segs=12, mat=C), fem)
+        for sgn in (-1, 1):                                             # cable runs
+            sk(bm_cyl(bm, hip.lerp(knee, 0.08) - upn * 0.3 + side * sgn * 0.26,
+                      hip.lerp(knee, 0.9) - upn * 0.3 + side * sgn * 0.24, 0.045, segs=8, mat=J), fem)
+        # knee: hexagonal hinge block with bolted caps and a status light
+        sk(bm_cyl(bm, knee - n * 0.5, knee + n * 0.5, 0.52, segs=6, mat=A), fem)
+        sk(bm_cyl(bm, knee + n * 0.5, knee + n * 0.58, 0.34, segs=6, mat=MECH), fem)
+        sk(bm_cyl(bm, knee - n * 0.58, knee - n * 0.5, 0.34, segs=6, mat=MECH), fem)
+        sk(bm_cyl(bm, knee + n * 0.58, knee + n * 0.61, 0.09, segs=12, mat=LITE), fem)
+        # tibia: long tapering shell, push rods, piston foot with a blunt spike
+        sk(bm_loft(bm, knee, foot, [(-0.03, 0.62, 0.62, 0.0), (0.1, 0.78, 0.76, 0.05),
+                                    (0.4, 0.66, 0.64, 0.06), (0.7, 0.46, 0.44, 0.04),
+                                    (0.84, 0.34, 0.32, 0.0)], up=outward, mat=A), tib)
+        _, side, upt = beam_frame(knee, foot, outward)
+        for sgn in (-1, 1):
+            sk(bm_cyl(bm, knee.lerp(foot, 0.15) - upt * 0.36 + side * sgn * 0.16,
+                      knee.lerp(foot, 0.72) - upt * 0.2 + side * sgn * 0.1, 0.035, segs=8, mat=C), tib)
+        sk(bm_cyl(bm, knee.lerp(foot, 0.82), knee.lerp(foot, 0.93), 0.18, 0.16, segs=12, mat=MECH), tib)
+        sk(bm_cyl(bm, knee.lerp(foot, 0.86), knee.lerp(foot, 0.88), 0.19, segs=12, mat=C), tib)
+        sk(bm_cyl(bm, knee.lerp(foot, 0.93), foot, 0.15, 0.02, segs=12, mat=MECH), tib)
 
 
 def build_leaper(cols, M):
@@ -1507,10 +1875,12 @@ def build_leaper(cols, M):
     sk = Skin(groups)
     leaper_geometry(sk)
     bmesh.ops.scale(sk.bm, vec=(LEAPER_SCALE,) * 3, verts=sk.bm.verts)
+    sk.bm.normal_update()
+    cube_uv(sk.bm, LEAPER_TEX_TILE)
     mesh = mesh_obj("Leaper_Body", sk.bm, coll, [M[m] for m in LEAPER_MATS], rest=(0, 0, 0))
     for g in groups:
         mesh.vertex_groups.new(name=g)
-    add_bevel(mesh, 0.018, 2, 40)
+    add_bevel(mesh, 0.025, 2, 40)
     mod = mesh.modifiers.new("Armature", "ARMATURE")
     mod.object = arm
     mesh.parent = arm
@@ -1526,7 +1896,7 @@ def build_leaper(cols, M):
         ob.matrix_parent_inverse = tail_m.inverted()
         ob.matrix_basis = local_matrix
 
-    eye_pos = lv((0, 2.48, 0.06))        # just in front of the lens surface
+    eye_pos = lv((0, 1.9, 0.0))          # just in front of the lens surface
     spot = bpy.data.lights.new("Leaper_Searchlight", "SPOT")
     spot.energy = 2600.0
     spot.color = (1.0, 0.1, 0.03)
@@ -1538,12 +1908,12 @@ def build_leaper(cols, M):
     aim = Vector((0, 1, -0.03)).to_track_quat("-Z", "Y").to_matrix().to_4x4()
     on_head(spot_ob, Matrix.Translation(eye_pos) @ aim)
     glow = bpy.data.lights.new("Leaper_EyeGlow", "POINT")
-    glow.energy = 120.0
+    glow.energy = 90.0
     glow.color = (1.0, 0.12, 0.03)
     glow.shadow_soft_size = 0.25
     glow_ob = bpy.data.objects.new("Leaper_EyeGlow", glow)
     coll.objects.link(glow_ob)
-    on_head(glow_ob, Matrix.Translation(eye_pos + Vector((0, 0.1, 0))))
+    on_head(glow_ob, Matrix.Translation(eye_pos + Vector((0, 0.45, 0))))
     core = bpy.data.lights.new("Leaper_CoreGlow", "POINT")
     core.energy = 35.0
     core.color = (1.0, 0.4, 0.08)
@@ -1551,7 +1921,7 @@ def build_leaper(cols, M):
     core_ob = bpy.data.objects.new("Leaper_CoreGlow", core)
     coll.objects.link(core_ob)
     core_ob.parent = arm
-    core_ob.location = lv((0, -2.45, 0.05))
+    core_ob.location = lv((0, -1.9, 0.05))
     return dict(arm=arm, feet=feet, mesh=mesh, spot=spot_ob)
 
 
@@ -1585,9 +1955,9 @@ BODY = Track([
     (146, (Vector((0.1, -4.4, 5.0)), Vector((22, 0, 0))), "o"),
     (156, (Vector((0.1, -4.0, 4.6)), Vector((10, 0, 0)))),
     (168, (Vector((0.15, -3.3, 4.4)), Vector((0, 0, 0)))),
-    (180, (Vector((0.2, -2.6, 4.25)), Vector((-6, 0, 0)))),
-    (200, (Vector((0.25, -2.35, 4.2)), Vector((-8, 0, 0)))),
-    (228, (Vector((0.3, -2.2, 4.2)), Vector((-8, 0, 0)))),
+    (180, (Vector((0.2, -2.6, 4.5)), Vector((-3, 0, 0)))),
+    (200, (Vector((0.25, -2.35, 4.55)), Vector((-4, 0, 0)))),
+    (228, (Vector((0.3, -2.2, 4.55)), Vector((-4, 0, 0)))),
     (240, (Vector((-0.1, -5.0, 4.6)), Vector((2, 3, 0)))),
     (246, (Vector((-0.1, -4.75, 4.3)), Vector((-6, 5, 0))), "i"),
     (262, (Vector((-0.1, -4.45, 4.35)), Vector((-6, 4, 0)))),
@@ -1799,21 +2169,38 @@ def raider_part(joint, bm):
 
 
 def build_raider(cols, M):
+    """The Raider is a puppet of empties that carries the acting. With MPFB
+    available a realistic MakeHuman body is generated and its game rig is
+    baked from the puppet; otherwise the puppet wears primitive body parts."""
     coll = cols["Raider"]
+    hs = mpfb_human_service()
+    human = build_raider_human(coll, hs) if hs else None
+    joint_pos = {name: Vector(pos) for name, _, pos in RAIDER_JOINTS}
+    rig = None
+    if human:
+        rig = human[0]
+        bones = rig.data.bones
+        for jn, bn in RIG_MAP.items():
+            joint_pos[jn] = bones[bn].head_local.copy()
+        for sfx in (".L", ".R"):        # straightened limb chains (arms hang, legs straight)
+            for a, b in (("upperarm", "forearm"), ("forearm", "hand"), ("thigh", "shin"), ("shin", "foot")):
+                joint_pos[b + sfx] = joint_pos[a + sfx] - Vector((0, 0, bones[RIG_MAP[a + sfx]].length))
     root = new_empty("Raider", coll, (0, 0, FLOOR2), 0.3, "ARROWS")
     joints, rest = {}, {}
-    for name, parent, pos in RAIDER_JOINTS:
+    for name, parent, _ in RAIDER_JOINTS:
         j = new_empty("RJ_" + name, coll, (0, 0, 0), 0.06)
         j.parent = joints[parent] if parent else root
-        p = Vector(pos)
+        p = joint_pos[name]
         j.location = p - (rest[parent] if parent else Vector())
         j.rotation_mode = "XYZ"
         joints[name], rest[name] = j, p
         bm = bmesh.new()
-        raider_part(name, bm)
+        (raider_gear if rig else raider_part)(name, bm)
         if len(bm.verts):
             part = mesh_obj("Raider_" + name, bm, coll, [M[m] for m in RAIDER_MATS], sharp_deg=50)
             part.parent = j
+        else:
+            bm.free()
     spot = bpy.data.lights.new("Raider_Flashlight", "SPOT")
     spot.energy = 70.0
     spot.color = (1.0, 0.9, 0.72)
@@ -1823,8 +2210,138 @@ def build_raider(cols, M):
     fl = bpy.data.objects.new("Raider_Flashlight", spot)
     coll.objects.link(fl)
     fl.parent = joints["hand.R"]
-    fl.location = (0, 0, -0.18)
-    return dict(root=root, joints=joints, rest=rest)
+    fl.location = (0, -0.02, -0.21) if rig else (0, 0, -0.18)
+    out = dict(root=root, joints=joints, rest=rest, rig=rig)
+    if rig:
+        bones = rig.data.bones
+        down = Vector((0, 0, -1))
+        out["bind"] = {}
+        for jn, bn in RIG_MAP.items():
+            b = bones[bn]
+            q = Quaternion()
+            if jn.split(".")[0] in STRAIGHTEN:
+                q = (b.tail_local - b.head_local).normalized().rotation_difference(down)
+            out["bind"][bn] = (jn, q.to_matrix() @ b.matrix_local.to_3x3())
+    return out
+
+
+# MakeHuman recipe for the realistic Raider (every asset is from the CC0 system pack)
+RAIDER_HUMAN = {
+    "name": "RaiderHuman",
+    "phenotype": {"gender": 0.0, "age": 0.45, "muscle": 0.62, "weight": 0.42, "height": 0.55,
+                  "proportions": 0.6, "cupsize": 0.45, "firmness": 0.5,
+                  "race": {"african": 0.8, "caucasian": 0.12, "asian": 0.08}},
+    "skin_mhmat": "young_african_female.mhmat",
+    "skin_material_type": "ENHANCED_SSS",
+    "eyes": "high-poly.mhclo", "eyes_material_type": "PROCEDURAL_EYES",
+    "eyebrows": "eyebrow001.mhclo", "eyelashes": "eyelashes01.mhclo",
+    "hair": "afro01.mhclo",
+    "clothes": ["male_worksuit01.mhclo", "shoes02.mhclo"],
+    "rig": "game_engine",
+}
+# puppet joint -> game_engine bone; limbs listed in STRAIGHTEN are rotated
+# from MakeHuman's A-pose to the puppet's arms-down rest pose
+RIG_MAP = {"hips": "pelvis", "spine": "spine_01", "chest": "spine_03", "neck": "neck_01", "head": "head"}
+for _s, _b in ((".L", "_l"), (".R", "_r")):
+    RIG_MAP.update({"upperarm" + _s: "upperarm" + _b, "forearm" + _s: "lowerarm" + _b,
+                    "hand" + _s: "hand" + _b, "thigh" + _s: "thigh" + _b,
+                    "shin" + _s: "calf" + _b, "foot" + _s: "foot" + _b})
+STRAIGHTEN = ("upperarm", "forearm", "hand", "thigh", "shin")
+
+
+def raider_gear(joint, bm):
+    """Kit worn over the MakeHuman body (joint-local, MakeHuman proportions)."""
+    base = joint.split(".")[0]
+    side = 1.0 if joint.endswith(".L") else -1.0
+    if base == "hips":
+        bm_cyl(bm, (0, 0.0, 0.0), (0, 0.0, 0.06), 0.175, squash=(1, 0.78), segs=24, mat=GE)
+        for sx in (-1, 1):
+            bm_box(bm, (sx * 0.17, -0.03, -0.02), (0.06, 0.1, 0.12), mat=GE)
+        bm_box(bm, (0.0, 0.15, -0.01), (0.18, 0.06, 0.11), mat=GE)
+    elif base == "chest":
+        bm_box(bm, (0, 0.24, 0.2), (0.38, 0.22, 0.5), mat=CA)
+        bm_box(bm, (0, 0.24, 0.45), (0.4, 0.24, 0.06), mat=CA)
+        bm_box(bm, (0, 0.36, 0.13), (0.28, 0.04, 0.24), mat=GE)
+        bm_cyl(bm, (-0.23, 0.25, 0.56), (0.23, 0.25, 0.56), 0.09, segs=14, mat=BR)
+        for sx in (-1, 1):
+            bm_box(bm, (sx * 0.22, 0.23, 0.1), (0.06, 0.16, 0.24), mat=GE)
+            bm_cyl(bm, (sx * 0.12, 0.13, 0.4), (sx * 0.15, -0.1, 0.12), 0.02, squash=(2.2, 0.6), segs=8, mat=GE)
+        bm_cyl(bm, (0.14, 0.32, 0.42), (0.19, 0.38, 1.1), 0.007, segs=6, mat=GE)
+        bm_sphere(bm, (0.19, 0.38, 1.1), 0.014, mat=RL_)
+    elif base == "head":
+        bm_cyl(bm, (0, 0.0, 0.17), (0, 0.0, 0.19), 0.1, squash=(1, 1.12), segs=24, mat=GE)
+        for sx in (-1, 1):       # goggles pushed up onto the forehead
+            bm_cyl(bm, (sx * 0.042, -0.1, 0.176), (sx * 0.042, -0.128, 0.184), 0.028, segs=16, mat=ME)
+            bm_cyl(bm, (sx * 0.042, -0.126, 0.184), (sx * 0.042, -0.132, 0.186), 0.024, segs=16, mat=GL)
+    elif base == "hand" and side < 0:
+        bm_cyl(bm, (0, -0.02, -0.04), (0, -0.02, -0.2), 0.021, 0.026, segs=12, mat=ME)
+        bm_cyl(bm, (0, -0.02, -0.2), (0, -0.02, -0.206), 0.024, segs=12, mat=LE)
+
+
+def _recolor_mpfb(objs):
+    """Work suit -> scavenger mustard/grey, brown eyes."""
+    for ob in objs:
+        if ob.type != "MESH":
+            continue
+        for slot in ob.material_slots:
+            mat = slot.material
+            if mat is None or mat.node_tree is None:
+                continue
+            nt = mat.node_tree
+            if "worksuit" in mat.name:
+                tex = nt.nodes.get("diffuseTexture")
+                if tex is None:
+                    continue
+                targets = [l.to_socket for l in tex.outputs["Color"].links]
+                hsv = _node(nt, "ShaderNodeHueSaturation", (tex.location.x + 250, tex.location.y + 200))
+                hsv.inputs["Hue"].default_value = 0.01           # denim blue -> mustard
+                hsv.inputs["Saturation"].default_value = 1.25
+                hsv.inputs["Value"].default_value = 0.95
+                nt.links.new(tex.outputs["Color"], hsv.inputs["Color"])
+                sep = _node(nt, "ShaderNodeSeparateColor", (tex.location.x + 250, tex.location.y - 150))
+                try:
+                    sep.mode = "HSV"
+                except (AttributeError, TypeError):
+                    pass
+                nt.links.new(tex.outputs["Color"], sep.inputs[0])
+                shirt = _math(nt, "LESS_THAN", sep.outputs[1], 0.18, loc=(tex.location.x + 450, tex.location.y - 150))
+                col = _mix(nt, "MIX", shirt, hsv.outputs["Color"], (0.09, 0.09, 0.085),
+                           (tex.location.x + 600, tex.location.y + 100))
+                for sock in targets:
+                    nt.links.new(col, sock)
+            for n in nt.nodes:
+                if n.bl_idname == "ShaderNodeGroup" and "IrisMajorColor" in n.inputs:
+                    n.inputs["IrisMajorColor"].default_value = (0.09, 0.045, 0.02, 1.0)
+                    n.inputs["IrisMinorColor"].default_value = (0.2, 0.1, 0.04, 1.0)
+
+
+def build_raider_human(coll, hs):
+    """Realistic Raider body from MPFB; returns (armature, objects) or None."""
+    info = json.loads(json.dumps(RAIDER_HUMAN))
+    for key in ("tongue", "teeth", "proxy"):
+        info.setdefault(key, "")
+    info.setdefault("targets", [])
+    info.setdefault("expressions", [])
+    info.setdefault("skin_material_settings", {})
+    info.setdefault("eyes_material_settings", {})
+    settings = hs.get_default_deserialization_settings()
+    settings["subdiv_levels"] = 1
+    before = set(bpy.data.objects)
+    try:
+        hs.deserialize_from_dict(info, settings)
+    except Exception as exc:
+        print("[assets] MPFB human failed:", exc)
+        return None
+    new = [ob for ob in bpy.data.objects if ob not in before]
+    arm = next((ob for ob in new if ob.type == "ARMATURE"), None)
+    if arm is None:
+        return None
+    for ob in new:
+        for c in list(ob.users_collection):
+            c.objects.unlink(ob)
+        coll.objects.link(ob)
+    _recolor_mpfb(new)
+    return arm, new
 
 
 def _pose(hips_z, **joints):
@@ -1863,10 +2380,10 @@ RAIDER_POSES = {
                      head=(-14, 0, 0), upperarm_R=(-100, 0, 6), forearm_R=(-6, 0, 0),
                      upperarm_L=(28, -18, 0), forearm_L=(-10, 0, 0), **SIT_LEGS),
     "sit_terror": _pose(0.19, hips=(-16, 0, 0), spine=(20, 0, -8), chest=(16, 0, -12),
-                        neck=(4, 0, -12), head=(-6, 0, -34),
+                        neck=(2, 0, -8), head=(-8, 0, -18),
                         thigh_L=(-122, 0, 8), shin_L=(108, 0, 0), foot_L=(30, 0, 0),
                         thigh_R=(-122, 0, -8), shin_R=(108, 0, 0), foot_R=(30, 0, 0),
-                        upperarm_R=(-118, 0, 28), forearm_R=(-92, 0, 0),
+                        upperarm_R=(-150, 0, 22), forearm_R=(-62, 0, 0),
                         upperarm_L=(22, -28, 0), forearm_L=(-12, 0, 0)),
 }
 
@@ -1885,19 +2402,54 @@ RAIDER_ROOT = Track([  # (x, y, facing angle about Z in degrees)
 FEAR = Track([(1, 0.5), (60, 0.6), (72, 1.0), (110, 0.8), (186, 0.8), (194, 1.0), (246, 1.6), (288, 1.4)])
 
 
+_RIG_PREV = {}
+
+
+def _bake_rig(rig, bind, world, frame):
+    """Key the MPFB game rig so every mapped bone matches its puppet joint
+    (rotation incl. A-pose correction, position at the joint)."""
+    inv_arm = rig.matrix_world.inverted()
+    want = {}
+    for bn, (jn, rest_rot) in bind.items():
+        m = world[jn]
+        want[bn] = inv_arm @ (Matrix.Translation(m.translation) @ (m.to_3x3() @ rest_rot).to_4x4())
+    pose = {}
+    for b in sorted(rig.data.bones, key=lambda b: len(b.parent_recursive)):
+        rest = b.matrix_local
+        if b.parent:
+            prest, ppose = b.parent.matrix_local, pose[b.parent.name]
+            mine = want.get(b.name, ppose @ prest.inverted() @ rest)
+            basis = (prest.inverted() @ rest).inverted() @ ppose.inverted() @ mine
+        else:
+            mine = want.get(b.name, rest)
+            basis = rest.inverted() @ mine
+        pose[b.name] = mine
+        if b.name in want or b.name == "pelvis":
+            pb = rig.pose.bones[b.name]
+            pb.rotation_mode = "QUATERNION"
+            loc, rot, _ = basis.decompose()
+            prev = _RIG_PREV.get(b.name)
+            if prev is not None and rot.dot(prev) < 0:      # keep keys on one hemisphere
+                rot.negate()
+            _RIG_PREV[b.name] = rot
+            pb.location = loc
+            pb.rotation_quaternion = rot
+            pb.keyframe_insert("location", frame=frame)
+            pb.keyframe_insert("rotation_quaternion", frame=frame)
+
+
 def animate_raider(r):
     root, joints, rest = r["root"], r["joints"], r["rest"]
+    order = [name for name, _, _ in RAIDER_JOINTS]
+    parents = {name: parent for name, parent, _ in RAIDER_JOINTS}
     pose_track = Track([(k[0], RAIDER_POSES[k[1]]) + tuple(k[2:]) for k in RAIDER_POSE_KEYS])
     for f in range(FRAME_START, FRAME_END + 1):
         x, y, ang = RAIDER_ROOT(f)
-        root.location = (x, y, FLOOR2)
-        root.rotation_euler = (0, 0, math.radians(ang))
-        root.keyframe_insert("location", frame=f)
-        root.keyframe_insert("rotation_euler", frame=f)
         pose = pose_track(f)
         fear = FEAR(f)
         breath = math.sin(f * 2 * math.pi / (FPS * (0.9 if fear > 0.9 else 1.4)))
-        for name, j in joints.items():
+        rots = {}
+        for name in order:
             v = pose.get(name, Vector((0, 0, 0))).copy()
             if name in ("hand.R", "forearm.R", "head", "neck"):   # trembling
                 sd = sum(map(ord, name))
@@ -1905,11 +2457,33 @@ def animate_raider(r):
                              nz(f * 0.85, sd % 83) * 2.2)) * fear
             if name == "chest":
                 v.x += 2.0 * breath * fear
-            j.rotation_euler = rad3(v)
+            rots[name] = rad3(v)
+        local = {name: (Vector((0, 0, pose["hips_z"])) if name == "hips"
+                        else rest[name] - rest[parents[name]]) for name in order}
+        root_m = Matrix.Translation((x, y, FLOOR2)) @ Matrix.Rotation(math.radians(ang), 4, "Z")
+        world = {}
+        for name in order:
+            pm = world[parents[name]] if parents[name] else root_m
+            world[name] = pm @ Matrix.Translation(local[name]) @ rots[name].to_matrix().to_4x4()
+        # keep the body on the floor: lowest of soles, knees and backside touches it
+        contact = [world["foot" + s].translation.z - 0.075 for s in (".L", ".R")]
+        contact += [world["shin" + s].translation.z - 0.06 for s in (".L", ".R")]
+        contact.append(world["hips"].translation.z - 0.11)
+        dz = FLOOR2 - min(contact)
+        for name in order:
+            world[name] = Matrix.Translation((0, 0, dz)) @ world[name]
+        root.location = (x, y, FLOOR2 + dz)
+        root.rotation_euler = (0, 0, math.radians(ang))
+        root.keyframe_insert("location", frame=f)
+        root.keyframe_insert("rotation_euler", frame=f)
+        for name, j in joints.items():
+            j.rotation_euler = rots[name]
             j.keyframe_insert("rotation_euler", frame=f)
         hips = joints["hips"]
-        hips.location = (0.0, 0.0, pose["hips_z"])
+        hips.location = local["hips"]
         hips.keyframe_insert("location", frame=f)
+        if r.get("rig"):
+            _bake_rig(r["rig"], r["bind"], world, f)
 
 
 # =============================================================================
@@ -2129,8 +2703,8 @@ SHOTS = [
          target=Track([(229, Vector((2.2, 6.2, 4.0))), (268, Vector((2.35, 6.3, 3.95)))]),
          lens=Track([(229, 24.0), (268, 24.0)]), focus=Track([(229, 2.9), (268, 2.8)])),
     dict(name="CAM_06_Raider_CloseUp", start=269, end=288, fstop=2.0, shake=1.2, exposure=0.8,
-         pos=Track([(269, Vector((-0.15, 5.2, 4.05))), (288, Vector((0.05, 5.3, 4.02)))]),
-         target=Track([(269, Vector((2.42, 6.3, 4.05))), (288, Vector((2.45, 6.33, 4.02)))]),
+         pos=Track([(269, Vector((-0.15, 5.2, 4.15))), (288, Vector((0.05, 5.3, 4.12)))]),
+         target=Track([(269, Vector((2.4, 6.28, 4.2))), (288, Vector((2.43, 6.3, 4.18)))]),
          lens=Track([(269, 40.0), (288, 46.0)]), focus=Track([(269, 2.75), (288, 2.6)])),
 ]
 
@@ -2248,6 +2822,13 @@ def parse_args():
     p.add_argument("--render-frames", nargs="*", type=int, default=[], help="render these frames as stills")
     p.add_argument("--render-anim", action="store_true", help="render the whole shot sequence")
     p.add_argument("--out", default=None, help="output directory for renders")
+    p.add_argument("--assets", choices=("auto", "off"), default="auto",
+                   help="download free CC0 textures/HDRI (and use MPFB if installed); off = procedural only")
+    p.add_argument("--asset-dir", default=None, help="cache folder for downloaded assets")
+    p.add_argument("--tex-res", choices=("1k", "2k", "4k"), default="1k", help="Poly Haven texture resolution")
+    p.add_argument("--install-mpfb", action="store_true",
+                   help="download + install the MPFB add-on and MakeHuman CC0 assets for a realistic Raider")
+    p.add_argument("--pack", action="store_true", help="pack downloaded images into the saved .blend")
     return p.parse_args(argv)
 
 
@@ -2257,8 +2838,7 @@ def build(preview=False, engine="CYCLES"):
     setup_render(scene, preview, engine)
     cols = make_collections()
     M = build_materials()
-    build_world(scene)
-    build_sun(cols)
+    build_sun(cols, build_world(scene))
     build_environment(cols, M)
     build_building(cols, M)
     chunks = build_breach_wall(cols, M)
@@ -2270,15 +2850,21 @@ def build(preview=False, engine="CYCLES"):
     animate_raider(raider)
     build_fx(cols, M)
     build_cameras(cols, scene)
+    for mat in M.values():
+        mat.use_fake_user = False
     scene.frame_set(FRAME_START)
     return scene
 
 
 def main():
     args = parse_args()
+    ASSETS.update(enabled=args.assets != "off", dir=args.asset_dir, tex_res=args.tex_res,
+                  install_mpfb=args.install_mpfb)
     scene = build(args.preview, args.engine)
     out = args.out or os.path.join(os.path.dirname(bpy.data.filepath) if bpy.data.filepath else os.getcwd(), "render")
     if args.save:
+        if args.pack:
+            bpy.ops.file.pack_all()
         bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(args.save), compress=True)
         print("Saved", os.path.abspath(args.save))
     if args.render_frames:
