@@ -11,15 +11,18 @@ terrified **Raider** cornered in a second-floor room.
 |---|---|
 | ![Pounce](previews/01_pounce.jpg) | ![The rip](previews/03_rip.jpg) |
 | ![Searchlight](previews/04_searchlight.jpg) | ![Stab](previews/05_stab.jpg) |
-| ![Close-up](previews/06_closeup.jpg) | A low-res flipbook of all 288 frames is in [`previews/flipbook_lowres.mp4`](previews/flipbook_lowres.mp4). |
+| ![Reaction](previews/07_reaction.jpg) | ![Close-up](previews/06_closeup.jpg) |
+
+A low-res flipbook of all 288 frames is in [`previews/flipbook_lowres.mp4`](previews/flipbook_lowres.mp4).
 
 One Python script builds everything: terrain, buildings, a pre-fractured
 wall, the IK-rigged Leaper, the Raider, interior props, the dust, spark and
 debris FX, lighting, six cameras with handheld shake, and timeline cuts. For
 photorealism it pulls in **free CC0 assets**: Poly Haven photo textures and a
 desert HDRI sky, plus a realistic MakeHuman body for the Raider via the MPFB
-add-on. Without network access it falls back to fully procedural shading and
-a primitive Raider.
+add-on, with an animated facial performance built from ARKit face units.
+Without network access it falls back to fully procedural shading and a
+primitive Raider.
 
 ## Files
 
@@ -34,11 +37,12 @@ a primitive Raider.
 | # | Frames | Camera | Beat |
 |---|---|---|---|
 | 1 | 1-60 | `CAM_01_Exterior_Wide` | The Leaper pounces off a ruined tower, lands in a ring of sand, rears up and makes the first strike on the wall |
-| 2 | 61-120 | `CAM_02_Interior_Corner` | Inside: the wall caves in. Two more strikes blow chunks across the room, and the Raider is knocked back and scrambles into the corner |
-| 3 | 121-168 | `CAM_03_Exterior_Rip` | The Leaper hooks both forelegs into the breach and rips the wall out in one pull |
-| 4 | 169-228 | `CAM_04_Leaper_POV` | Just outside the breach, past the Leaper's head, as it pushes into the hole. Its red searchlight sweeps the room and locks onto the Raider |
-| 5 | 229-268 | `CAM_05_Floor_Level` | A foreleg spears through the breach and slams into the floor short of the Raider, then drags closer |
-| 6 | 269-288 | `CAM_06_Raider_CloseUp` | Close on the Raider as the second stab lands even closer |
+| 2 | 61-96 | `CAM_02_Interior_Corner` | Inside: the wall caves in. A second strike blows chunks across the room, and the Raider is knocked back and scrambles into the corner |
+| 3 | 97-120 | `CAM_03_Raider_Reaction` | Close on her face as the third strike lands: she flinches, then stares at the breach, terrified |
+| 4 | 121-168 | `CAM_04_Exterior_Rip` | The Leaper hooks both forelegs into the breach and rips the wall out in one pull |
+| 5 | 169-228 | `CAM_05_Leaper_POV` | Just outside the breach, past the Leaper's head, as it pushes into the hole. Its red searchlight sweeps the room and locks onto the Raider |
+| 6 | 229-268 | `CAM_06_Floor_Level` | A foreleg spears through the breach and slams into the floor short of the Raider, then drags closer |
+| 7 | 269-288 | `CAM_07_Raider_CloseUp` | Close on the Raider, panicking and then screaming as the second stab lands even closer |
 
 Cuts use timeline markers bound to cameras, so rendering the animation
 switches cameras automatically.
@@ -74,7 +78,7 @@ blender --python arc_raiders_leaper_attack.py -- --engine EEVEE
 | Option | Effect |
 |---|---|
 | `--assets auto` (default) / `off` | Download and use the CC0 textures and HDRI (and MPFB if installed), or stay procedural |
-| `--install-mpfb` | Download and enable the MPFB add-on and the MakeHuman CC0 asset pack (~280 MB, once) |
+| `--install-mpfb` | Download and enable the MPFB add-on and the MakeHuman CC0 asset pack (~280 MB, once). The face-unit pack (0.3 MB) is fetched into the cache automatically. |
 | `--tex-res 1k/2k/4k` | Poly Haven texture resolution (default 1k) |
 | `--asset-dir PATH` | Download cache (default: Blender's user `datafiles/arc_leaper_assets`) |
 | `--pack` | Pack all images into the saved `.blend` |
@@ -126,12 +130,20 @@ Collections under `ARC_LeaperAttack`:
 - **Raider**: the acting lives on a jointed puppet (empties named `RJ_*`):
   crouch, flinch, scramble, cower, aim and terror poses, with fear-scaled
   trembling and breathing, and an automatic floor-contact fix. With MPFB
-  available, a realistic MakeHuman woman (subsurface skin, real eyes, afro
-  hair, a work suit recolored scavenger-mustard, boots) is generated and
-  her game rig is baked from the puppet every frame. She wears the kit: a
-  big backpack with bedroll and radio antenna, belt pouches, goggles on her
-  forehead, and a working flashlight. Without MPFB, the puppet wears
-  primitive body parts instead.
+  available, a realistic MakeHuman woman (subsurface skin, brown eyes,
+  teeth and tongue, slicked-back hair, a work suit recolored
+  scavenger-mustard, boots) is generated and her game rig is baked from the
+  puppet every frame. She wears the kit: a big backpack with bedroll and
+  radio antenna, belt pouches, and a working flashlight. Without MPFB, the
+  puppet wears primitive body parts instead.
+- **Facial performance** (realistic Raider only): 33 ARKit face units are
+  loaded as shape keys and carried over to her eyes, brows, lashes, teeth
+  and tongue. They play a scripted performance: alert, flinching at each
+  impact, panicking while she scrambles, whimpering, wide-eyed terror when
+  the searchlight finds her, and screaming at both stabs. On top run
+  procedural blinks (faster when she's scared), panicked breathing, and eye
+  gaze that tracks the threat: the bulging wall, then the Leaper's optic,
+  then the leg.
 - **FX**: volumetric dust puffs, spark and gravel particle bursts, tile
   shards, ceiling dust, and floor-crack decals at the stab points.
 - **Lights / Cameras**: the sun lamp, the six shot cameras, and per-shot
@@ -148,6 +160,9 @@ All choreography lives in plain data near the top of each section:
   `s` smooth, `i` ease-in (strikes), `o` ease-out, `l` linear, `h` hold.
 - `RAIDER_POSES`, `RAIDER_POSE_KEYS`, `RAIDER_ROOT`, `FEAR`: the Raider's
   acting.
+- `FACE`, `FACE_KEYS`: facial expressions as weights of ARKit face units
+  (`browInnerUp`, `eyeWide*`, `jawOpen`, ...; `*` means both sides) and
+  when they play.
 - `RAIDER_HUMAN`: the MakeHuman recipe (body shape, skin, hair, clothes),
   using any asset name from the MakeHuman system pack.
 - `POLYHAVEN_TEX`, `HDRI_ID`: swap in any Poly Haven texture or HDRI by its id.
@@ -164,7 +179,8 @@ in the Graph Editor after generating.
 |---|---|---|
 | Textures: `painted_plaster_wall`, `chipped_concrete`, `floor_tiles_06`, `dense_sand`, `weathered_planks`, `rusty_metal_02`, `blue_metal_plate` | [Poly Haven](https://polyhaven.com) | CC0 |
 | HDRI: `klippad_sunrise_2` | [Poly Haven](https://polyhaven.com/a/klippad_sunrise_2) | CC0 |
-| Body, skin, eyes, hair, work suit, boots | [MakeHuman system assets](https://static.makehumancommunity.org/assets/assetpacks.html) | CC0 |
+| Body, skin, eyes, hair, teeth, tongue, work suit, boots | [MakeHuman system assets](https://static.makehumancommunity.org/assets/assetpacks.html) | CC0 |
+| ARKit face units (`faceunits01`, by Mika Suominen) | [MakeHuman asset packs](https://static.makehumancommunity.org/assets/assetpacks/faceunits01.html) | CC0 |
 | Human generator add-on (used at build time, not redistributed) | [MPFB](https://extensions.blender.org/add-ons/mpfb/) | GPL-3.0 |
 
 Fan work. ARC Raiders and the Leaper belong to Embark Studios. The Leaper

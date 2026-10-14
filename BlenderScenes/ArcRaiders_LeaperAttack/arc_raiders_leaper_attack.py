@@ -18,11 +18,12 @@ with --assets off, everything falls back to procedural shading.
 
 Shot list (24 fps, frames 1-288, about 12 s)
   1   1- 60  Exterior wide: the Leaper pounces, lands, rears up, first strike
-  2  61-120  Interior: the wall caves in around the Raider, two more strikes
-  3 121-168  Exterior 3/4: the Leaper hooks the breach and rips the wall away
-  4 169-228  Over the Leaper's head: the red searchlight finds the Raider
-  5 229-268  Floor level: a leg spears into the room and misses
-  6 269-288  Close-up on the Raider as the second strike lands closer
+  2  61- 96  Interior: the wall caves in, the Raider is thrown back and scrambles
+  3  97-120  Reaction close-up: the third strike lands, she flinches, whimpers
+  4 121-168  Exterior 3/4: the Leaper hooks the breach and rips the wall away
+  5 169-228  Past the Leaper's head: the red searchlight finds the Raider
+  6 229-268  Floor level: a leg spears into the room and misses
+  7 269-288  Close-up on the Raider screaming as the second strike lands closer
 
 Usage
   In Blender: Scripting workspace > Open this file > Run Script.
@@ -426,6 +427,7 @@ POLYHAVEN_TEX = {   # material role -> Poly Haven texture id (CC0)
 }
 HDRI_ID = "klippad_sunrise_2"     # Poly Haven, golden-hour desert, CC0
 MPFB_PAGE = "https://extensions.blender.org/add-ons/mpfb/"
+FACEUNITS_PACK = "https://files.makehumancommunity.org/functional/faceunits01.zip"   # ARKit units, CC0
 MAKEHUMAN_PACK = ("https://files.makehumancommunity.org/asset_packs/makehuman_system_assets/"
                   "makehuman_system_assets_cc0.zip")
 _TEX_CACHE = {}
@@ -564,9 +566,23 @@ def _install_mpfb():
     return _mpfb_module()
 
 
+def faceunit_dir():
+    """Folder of ARKit face-unit targets (MakeHuman 'faceunits01', CC0),
+    downloaded into the asset cache; None when unavailable."""
+    d = os.path.join(asset_dir(), "faceunits01")
+    tdir = os.path.join(d, "targets", "faceunits")
+    if not os.path.isdir(tdir):
+        zpath = _download(FACEUNITS_PACK, os.path.join(asset_dir(), "faceunits01.zip"))
+        if not zpath:
+            return None
+        with zipfile.ZipFile(zpath) as zf:
+            zf.extractall(d)
+    return tdir if os.path.isdir(tdir) else None
+
+
 def mpfb_human_service():
-    """MPFB's HumanService with the MakeHuman CC0 system assets in place,
-    or None (then the procedural Raider is used)."""
+    """MPFB's services (human, target, face) with the MakeHuman CC0 system
+    assets in place, or None (then the procedural Raider is used)."""
     if not ASSETS["enabled"]:
         return None
     mod = _mpfb_module()
@@ -577,7 +593,8 @@ def mpfb_human_service():
               "(install MPFB from Get Extensions, or run with --install-mpfb)")
         return None
     try:
-        hs = importlib.import_module(mod + ".services.humanservice").HumanService
+        svc = {name: getattr(importlib.import_module("%s.services.%sservice" % (mod, name.lower())),
+                             name + "Service") for name in ("Human", "Target", "Face")}
         data = importlib.import_module(mod + ".services.locationservice").LocationService.get_user_data()
     except Exception as exc:
         print("[assets] MPFB could not be loaded:", exc)
@@ -593,7 +610,7 @@ def mpfb_human_service():
             return None
         with zipfile.ZipFile(zpath) as zf:
             zf.extractall(data)
-    return hs
+    return svc
 
 
 # =============================================================================
@@ -2173,8 +2190,8 @@ def build_raider(cols, M):
     available a realistic MakeHuman body is generated and its game rig is
     baked from the puppet; otherwise the puppet wears primitive body parts."""
     coll = cols["Raider"]
-    hs = mpfb_human_service()
-    human = build_raider_human(coll, hs) if hs else None
+    svc = mpfb_human_service()
+    human = build_raider_human(coll, svc) if svc else None
     joint_pos = {name: Vector(pos) for name, _, pos in RAIDER_JOINTS}
     rig = None
     if human:
@@ -2211,7 +2228,7 @@ def build_raider(cols, M):
     coll.objects.link(fl)
     fl.parent = joints["hand.R"]
     fl.location = (0, -0.02, -0.21) if rig else (0, 0, -0.18)
-    out = dict(root=root, joints=joints, rest=rest, rig=rig)
+    out = dict(root=root, joints=joints, rest=rest, rig=rig, face=human[2] if human else None)
     if rig:
         bones = rig.data.bones
         down = Vector((0, 0, -1))
@@ -2235,7 +2252,8 @@ RAIDER_HUMAN = {
     "skin_material_type": "ENHANCED_SSS",
     "eyes": "high-poly.mhclo", "eyes_material_type": "PROCEDURAL_EYES",
     "eyebrows": "eyebrow001.mhclo", "eyelashes": "eyelashes01.mhclo",
-    "hair": "afro01.mhclo",
+    "hair": "short04.mhclo",
+    "teeth": "teeth_base.mhclo", "tongue": "tongue01.mhclo",
     "clothes": ["male_worksuit01.mhclo", "shoes02.mhclo"],
     "rig": "game_engine",
 }
@@ -2250,7 +2268,8 @@ STRAIGHTEN = ("upperarm", "forearm", "hand", "thigh", "shin")
 
 
 def raider_gear(joint, bm):
-    """Kit worn over the MakeHuman body (joint-local, MakeHuman proportions)."""
+    """Kit worn over the MakeHuman body (joint-local, MakeHuman proportions);
+    the head is left bare so the facial performance reads."""
     base = joint.split(".")[0]
     side = 1.0 if joint.endswith(".L") else -1.0
     if base == "hips":
@@ -2268,11 +2287,6 @@ def raider_gear(joint, bm):
             bm_cyl(bm, (sx * 0.12, 0.13, 0.4), (sx * 0.15, -0.1, 0.12), 0.02, squash=(2.2, 0.6), segs=8, mat=GE)
         bm_cyl(bm, (0.14, 0.32, 0.42), (0.19, 0.38, 1.1), 0.007, segs=6, mat=GE)
         bm_sphere(bm, (0.19, 0.38, 1.1), 0.014, mat=RL_)
-    elif base == "head":
-        bm_cyl(bm, (0, 0.0, 0.17), (0, 0.0, 0.19), 0.1, squash=(1, 1.12), segs=24, mat=GE)
-        for sx in (-1, 1):       # goggles pushed up onto the forehead
-            bm_cyl(bm, (sx * 0.042, -0.1, 0.176), (sx * 0.042, -0.128, 0.184), 0.028, segs=16, mat=ME)
-            bm_cyl(bm, (sx * 0.042, -0.126, 0.184), (sx * 0.042, -0.132, 0.186), 0.024, segs=16, mat=GL)
     elif base == "hand" and side < 0:
         bm_cyl(bm, (0, -0.02, -0.04), (0, -0.02, -0.2), 0.021, 0.026, segs=12, mat=ME)
         bm_cyl(bm, (0, -0.02, -0.2), (0, -0.02, -0.206), 0.024, segs=12, mat=LE)
@@ -2315,8 +2329,11 @@ def _recolor_mpfb(objs):
                     n.inputs["IrisMinorColor"].default_value = (0.2, 0.1, 0.04, 1.0)
 
 
-def build_raider_human(coll, hs):
-    """Realistic Raider body from MPFB; returns (armature, objects) or None."""
+def build_raider_human(coll, svc):
+    """Realistic Raider body from MPFB; returns (armature, objects, face) or
+    None. `face` is the body mesh carrying the face-unit shape keys (or None
+    if the face pack could not be fetched)."""
+    hs = svc["Human"]
     info = json.loads(json.dumps(RAIDER_HUMAN))
     for key in ("tongue", "teeth", "proxy"):
         info.setdefault(key, "")
@@ -2341,7 +2358,36 @@ def build_raider_human(coll, hs):
             c.objects.unlink(ob)
         coll.objects.link(ob)
     _recolor_mpfb(new)
-    return arm, new
+    body = next((ob for ob in new if ob.name.endswith(".body")), None)
+    face = add_face_units(body, new, svc) if body else None
+    return arm, new, face
+
+
+def add_face_units(body, objs, svc):
+    """Load the ARKit face units the performance uses as shape keys on the
+    body, transfer them to eyes/brows/lashes/teeth/tongue/hair with MPFB, and
+    drive those copies from the body so one set of keys animates the face."""
+    tdir = faceunit_dir()
+    if tdir is None:
+        print("[assets] face-unit pack unavailable: the Raider keeps a neutral face")
+        return None
+    for unit in FACE_UNITS:
+        svc["Target"].load_target(body, os.path.join(tdir, unit + ".target"), weight=0.0, name=unit)
+    svc["Face"].interpolate_targets(body)
+    keys = body.data.shape_keys
+    for ob in objs:
+        if ob is body or ob.type != "MESH" or not ob.data.shape_keys:
+            continue
+        for kb in ob.data.shape_keys.key_blocks:
+            if kb.name in FACE_UNITS:
+                drv = kb.driver_add("value").driver
+                drv.type = "AVERAGE"
+                var = drv.variables.new()
+                var.type = "SINGLE_PROP"
+                var.targets[0].id_type = "KEY"
+                var.targets[0].id = keys
+                var.targets[0].data_path = 'key_blocks["%s"].value' % kb.name
+    return body
 
 
 def _pose(hips_z, **joints):
@@ -2376,8 +2422,8 @@ RAIDER_POSES = {
     "sit_cower": _pose(0.2, hips=(-12, 0, 0), spine=(16, 0, 0), chest=(12, 0, 0), neck=(-4, 0, 0),
                        head=(-6, 0, 0), upperarm_R=(-80, 0, 10), forearm_R=(-12, 0, 0),
                        upperarm_L=(-48, 0, -18), forearm_L=(-78, 0, 0), **SIT_LEGS),
-    "sit_aim": _pose(0.2, hips=(-14, 0, 0), spine=(0, 0, 0), chest=(-4, 0, 0), neck=(-8, 0, 0),
-                     head=(-14, 0, 0), upperarm_R=(-100, 0, 6), forearm_R=(-6, 0, 0),
+    "sit_aim": _pose(0.2, hips=(-14, 0, 0), spine=(0, 0, 0), chest=(-4, 0, 0), neck=(4, 0, 0),
+                     head=(8, 0, 0), upperarm_R=(-100, 0, 6), forearm_R=(-6, 0, 0),
                      upperarm_L=(28, -18, 0), forearm_L=(-10, 0, 0), **SIT_LEGS),
     "sit_terror": _pose(0.19, hips=(-16, 0, 0), spine=(20, 0, -8), chest=(16, 0, -12),
                         neck=(2, 0, -8), head=(-8, 0, -18),
@@ -2400,6 +2446,96 @@ RAIDER_ROOT = Track([  # (x, y, facing angle about Z in degrees)
     (246, Vector((2.2, 6.3, -22))), (258, Vector((2.45, 6.35, -24))), (288, Vector((2.45, 6.35, -24))),
 ])
 FEAR = Track([(1, 0.5), (60, 0.6), (72, 1.0), (110, 0.8), (186, 0.8), (194, 1.0), (246, 1.6), (288, 1.4)])
+
+
+# Facial performance: ARKit face units, "*" = both the Left and Right unit.
+FACE = {
+    "alert": {"browInnerUp": 0.8, "browOuterUp*": 0.45, "eyeWide*": 0.6, "mouthFrown*": 0.3,
+              "jawOpen": 0.07, "mouthStretch*": 0.2},
+    "flinch": {"eyeBlink*": 0.95, "eyeSquint*": 0.8, "browDown*": 0.6, "noseSneer*": 0.6,
+               "cheekSquint*": 0.7, "mouthStretch*": 0.7, "mouthUpperUp*": 0.5,
+               "mouthLowerDown*": 0.3, "jawOpen": 0.15},
+    "panic": {"browInnerUp": 1.0, "browOuterUp*": 0.6, "eyeWide*": 0.8, "jawOpen": 0.3,
+              "mouthStretch*": 0.5, "mouthLowerDown*": 0.4, "mouthUpperUp*": 0.15},
+    "whimper": {"browInnerUp": 1.0, "browOuterUp*": 0.3, "eyeWide*": 0.45, "mouthFrown*": 0.45,
+                "mouthStretch*": 0.45, "mouthLowerDown*": 0.15, "jawOpen": 0.12},
+    "terror": {"browInnerUp": 1.0, "browOuterUp*": 0.7, "eyeWide*": 1.0, "jawOpen": 0.35,
+               "mouthStretch*": 0.45, "mouthLowerDown*": 0.45, "mouthUpperUp*": 0.2},
+    "scream": {"browInnerUp": 1.0, "browOuterUp*": 0.5, "eyeWide*": 0.6, "eyeSquint*": 0.3,
+               "jawOpen": 0.8, "mouthStretch*": 0.75, "mouthLowerDown*": 0.7, "mouthUpperUp*": 0.5,
+               "noseSneer*": 0.3, "cheekSquint*": 0.3},
+}
+FACE_KEYS = [   # (frame, expression[, ease]) - follows the beats of the action
+    (1, "alert"), (71, "alert"), (73, "flinch", "o"), (79, "flinch"), (84, "panic"), (96, "panic"),
+    (98, "flinch", "o"), (103, "flinch"), (112, "whimper"), (184, "whimper"), (190, "terror", "o"),
+    (244, "terror"), (247, "scream", "o"), (258, "scream"), (265, "panic"), (279, "panic"),
+    (281, "scream", "o"), (288, "scream"),
+]
+_LR = ("Left", "Right")
+FACE_UNITS = sorted({u[:-1] + s if u.endswith("*") else u for e in FACE.values() for u in e
+                     for s in _LR} | {"eyeBlink" + s for s in _LR} | {"jawOpen"}
+                    | {"eyeLook%s%s" % (d, s) for d in ("Up", "Down", "In", "Out") for s in _LR})
+
+
+def _expand(expr):
+    out = {}
+    for unit, w in expr.items():
+        for name in ((unit[:-1] + s for s in _LR) if unit.endswith("*") else (unit,)):
+            out[name] = w
+    return out
+
+
+def _blink_frames():
+    """Deterministic blink starts: frequent when frightened, none mid-flinch."""
+    rng, f, out = random.Random(SEED + 31), 6, []
+    while f < FRAME_END:
+        f += int(rng.uniform(28, 70) / (0.6 + 0.4 * FEAR(f)))
+        out.append(f)
+    return out
+
+
+def _gaze_target(f):
+    """What the Raider stares at: the bulging wall, then the Leaper's optic,
+    then the leg spearing into the room."""
+    if f < 70:
+        return Vector((0.0, 0.2, 4.6))
+    if 236 <= f:
+        return FOOT_TRACKS["FR"](f)
+    return body_matrix(f) @ lv((0, 1.9, 0.0))
+
+
+def key_face(face, frame, head_m, face_track, blinks):
+    expr = {u: 0.0 for u in FACE_UNITS}
+    expr.update(_expand(face_track(frame)))
+    fear = FEAR(frame)
+    screaming = 1.0 if expr.get("jawOpen", 0.0) > 0.6 else 0.0
+    calm = 1.0 - max(expr.get("eyeBlinkLeft", 0.0), screaming)
+    # panting
+    expr["jawOpen"] += 0.06 * fear * calm * (0.5 + 0.5 * math.sin(frame * 2 * math.pi / (FPS * 0.55)))
+    # blinks (4-frame lid close), suppressed while the eyes are already shut
+    for b in blinks:
+        if b <= frame < b + 5 and calm > 0.5:
+            amt = (0.0, 0.75, 1.0, 0.6, 0.15)[frame - b]
+            for s in _LR:
+                expr["eyeBlink" + s] = max(expr["eyeBlink" + s], amt)
+                expr["eyeWide" + s] = expr.get("eyeWide" + s, 0.0) * (1.0 - amt)
+    # gaze: yaw/pitch of the threat in head space -> eyeLook units
+    local = head_m.inverted() @ _gaze_target(frame)
+    yaw = math.degrees(math.atan2(local.x, -local.y))       # + = towards her left
+    pitch = math.degrees(math.atan2(local.z - 0.12, math.hypot(local.x, local.y)))
+    h, v = clamp(abs(yaw) / 35.0), clamp(abs(pitch) / 25.0)
+    if yaw > 0:
+        expr["eyeLookOutLeft"], expr["eyeLookInRight"] = h, h
+    else:
+        expr["eyeLookInLeft"], expr["eyeLookOutRight"] = h, h
+    for s in _LR:
+        expr[("eyeLookUp" if pitch > 0 else "eyeLookDown") + s] = v
+    blocks = face.data.shape_keys.key_blocks
+    for unit, w in expr.items():
+        kb = blocks.get(unit)
+        if kb is not None:
+            kb.value = clamp(w)
+            kb.keyframe_insert("value", frame=frame)
 
 
 _RIG_PREV = {}
@@ -2443,6 +2579,8 @@ def animate_raider(r):
     order = [name for name, _, _ in RAIDER_JOINTS]
     parents = {name: parent for name, parent, _ in RAIDER_JOINTS}
     pose_track = Track([(k[0], RAIDER_POSES[k[1]]) + tuple(k[2:]) for k in RAIDER_POSE_KEYS])
+    face_track = Track([(k[0], FACE[k[1]]) + tuple(k[2:]) for k in FACE_KEYS])
+    blinks = _blink_frames()
     for f in range(FRAME_START, FRAME_END + 1):
         x, y, ang = RAIDER_ROOT(f)
         pose = pose_track(f)
@@ -2484,6 +2622,8 @@ def animate_raider(r):
         hips.keyframe_insert("location", frame=f)
         if r.get("rig"):
             _bake_rig(r["rig"], r["bind"], world, f)
+        if r.get("face"):
+            key_face(r["face"], f, world["head"], face_track, blinks)
 
 
 # =============================================================================
@@ -2685,27 +2825,31 @@ SHOTS = [
          pos=Track([(1, _gz(-11.5, -18.5, 1.5)), (60, _gz(-10.0, -16.6, 1.8))]),
          target=lambda f: (_leaper_target()(f).lerp(Vector((-0.5, -1.8, 4.4)), smoothstep((f - 24) / 26.0))),
          lens=Track([(1, 22.0), (60, 27.0)])),
-    dict(name="CAM_02_Interior_Corner", start=61, end=120, fstop=2.8, shake=1.0, exposure=1.3,
-         pos=Track([(61, Vector((-5.0, 6.3, 4.65))), (120, Vector((-4.6, 6.2, 4.5)))]),
-         target=Track([(61, Vector((1.1, 3.3, 4.2))), (120, Vector((1.2, 3.5, 4.3)))]),
-         lens=Track([(61, 22.0), (120, 24.0)]), focus=Track([(61, 5.6), (95, 6.4), (120, 6.6)])),
-    dict(name="CAM_03_Exterior_Rip", start=121, end=168, fstop=5.6, shake=0.8,
+    dict(name="CAM_02_Interior_Corner", start=61, end=96, fstop=2.8, shake=1.0, exposure=1.3,
+         pos=Track([(61, Vector((-5.0, 6.3, 4.65))), (96, Vector((-4.75, 6.25, 4.55)))]),
+         target=Track([(61, Vector((1.1, 3.3, 4.2))), (96, Vector((1.15, 3.4, 4.25)))]),
+         lens=Track([(61, 22.0), (96, 23.0)]), focus=Track([(61, 5.6), (95, 6.4)])),
+    dict(name="CAM_03_Raider_Reaction", start=97, end=120, fstop=2.4, shake=1.0, exposure=1.5,
+         pos=Track([(97, Vector((0.8, 4.8, 4.28))), (120, Vector((0.95, 4.95, 4.26)))]),
+         target=Track([(97, Vector((2.1, 6.25, 4.22))), (120, Vector((2.15, 6.2, 4.24)))]),
+         lens=Track([(97, 52.0), (120, 58.0)]), focus=Track([(97, 1.98), (120, 1.8)])),
+    dict(name="CAM_04_Exterior_Rip", start=121, end=168, fstop=5.6, shake=0.8,
          pos=Track([(121, _gz(12.0, -12.5, 1.3)), (168, _gz(11.2, -11.6, 1.5))]),
          target=Track([(121, Vector((-0.4, -2.2, 4.9))), (168, Vector((-0.4, -1.8, 4.7)))]),
          lens=Track([(121, 24.0), (168, 27.0)])),
-    dict(name="CAM_04_Leaper_POV", start=169, end=228, fstop=5.6, shake=0.7, exposure=0.6,
+    dict(name="CAM_05_Leaper_POV", start=169, end=228, fstop=5.6, shake=0.7, exposure=0.6,
          pos=Track([(169, Vector((0.9, -2.0, 5.6))), (228, Vector((1.0, -1.6, 5.5)))]),
          target=Track([(169, Vector((1.6, 4.5, 3.4))), (190, Vector((2.0, 5.6, 3.45))),
                        (228, Vector((2.1, 6.0, 3.5)))]),
          lens=Track([(169, 26.0), (228, 32.0)]), focus=Track([(169, 10.5), (228, 10.2)])),
-    dict(name="CAM_05_Floor_Level", start=229, end=268, fstop=2.8, shake=1.0, exposure=0.8,
+    dict(name="CAM_06_Floor_Level", start=229, end=268, fstop=2.8, shake=1.0, exposure=0.8,
          pos=Track([(229, Vector((0.9, 3.5, 3.85))), (268, Vector((1.0, 3.75, 3.82)))]),
          target=Track([(229, Vector((2.2, 6.2, 4.0))), (268, Vector((2.35, 6.3, 3.95)))]),
          lens=Track([(229, 24.0), (268, 24.0)]), focus=Track([(229, 2.9), (268, 2.8)])),
-    dict(name="CAM_06_Raider_CloseUp", start=269, end=288, fstop=2.0, shake=1.2, exposure=0.8,
-         pos=Track([(269, Vector((-0.15, 5.2, 4.15))), (288, Vector((0.05, 5.3, 4.12)))]),
-         target=Track([(269, Vector((2.4, 6.28, 4.2))), (288, Vector((2.43, 6.3, 4.18)))]),
-         lens=Track([(269, 40.0), (288, 46.0)]), focus=Track([(269, 2.75), (288, 2.6)])),
+    dict(name="CAM_07_Raider_CloseUp", start=269, end=288, fstop=2.0, shake=1.2, exposure=0.8,
+         pos=Track([(269, Vector((-0.15, 5.2, 4.18))), (288, Vector((0.05, 5.3, 4.16)))]),
+         target=Track([(269, Vector((2.3, 6.24, 4.22))), (288, Vector((2.3, 6.23, 4.2)))]),
+         lens=Track([(269, 60.0), (288, 68.0)]), focus=Track([(269, 2.66), (288, 2.48)])),
 ]
 
 
